@@ -1,0 +1,2 @@
+"""SSC Telegram support bot."""
+

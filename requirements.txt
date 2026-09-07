@@ -1,0 +1,6 @@
+aiogram==3.22.0
+aiosqlite==0.21.0
+openai==1.109.1
+pydantic-settings==2.10.1
+google-api-python-client>=2.0,<3
+google-auth>=2.0,<3
