@@ -109,6 +109,16 @@ def _is_wallet_completion(text: str) -> bool:
     return has_wallet and has_form_or_address and has_done
 
 
+def _is_new_hire_trigger(text: str) -> bool:
+    """"入职信息确认"/"新人入职" mark a submission as being about a new hire who may not have
+    an employee code yet -- the roster row should then be found by matching 候选人姓名/姓名/
+    简历名 first, instead of only by employee code."""
+    if not text:
+        return False
+    head = text[:80]
+    return "入职信息确认" in head or "新人入职" in head
+
+
 def _wallet_packet(profile: dict[str, object], result: dict[str, str]) -> str:
     return (
         "💰 钱包地址表单已匹配\n"
@@ -220,6 +230,7 @@ async def _save_profile_values(
     require_existing: bool = False,
     allow_incomplete: bool = False,
     extra_fields: dict[str, str] | None = None,
+    prefer_name_match: bool = False,
 ) -> bool:
     if not message.from_user:
         return False
@@ -254,7 +265,9 @@ async def _save_profile_values(
     sync_note = "已保存在机器人中，等待云表授权后自动同步。"
     if services.sheets.configured:
         try:
-            row = await services.sheets.sync_profile(saved, changes, is_new, extra_fields)
+            row = await services.sheets.sync_profile(
+                saved, changes, is_new, extra_fields, prefer_name_match
+            )
             await services.db.set_profile_sync(message.from_user.id, "synced", row)
             saved["sync_status"] = "synced"
             sync_note = f"已同步到花名册第 {row} 行，并写入变更记录。"
@@ -854,9 +867,8 @@ def build_dispatcher(services: Services) -> Dispatcher:
         trial_salary = values.pop("trial_salary", "")
         confirmed_salary = values.pop("confirmed_salary", "")
         values = clean_screenshot_values(values)
-        existing = await services.db.profile(message.from_user.id)
-        if not existing and not values.get("employee_code"):
-            await message.answer("其他缺失字段可以留空，但首次建立档案必须能识别员工编码，用于防止写错员工。请补充员工编码。")
+        if not values.get("employee_code") and not values.get("resume_name"):
+            await message.answer("其他缺失字段可以留空，但必须能识别员工编码或候选人姓名/姓名/简历名，用于防止写错员工。请补充其中之一。")
             return
         extra_fields: dict[str, str] = {}
         if trial_salary:
@@ -873,7 +885,13 @@ def build_dispatcher(services: Services) -> Dispatcher:
         raw = "[截图识别]\n" + "\n".join(
             f"{DISPLAY_LABELS.get(key, key)}：{value}" for key, value in values.items()
         )
-        await _save_profile_values(message, services, values, raw, allow_incomplete=True, extra_fields=extra_fields)
+        # 管理员发送的"入职信息确认"截图始终按新人处理：先按候选人姓名（即姓名/简历名）匹配花名册
+        # 里已有的条目（例如 HR 提前建好但还没分配员工编码的占位行），找到就继续在同一行填写，
+        # 而不是新建重复行。
+        await _save_profile_values(
+            message, services, values, raw, allow_incomplete=True,
+            extra_fields=extra_fields, prefer_name_match=True,
+        )
 
     @router.message(F.text)
     async def redirect_to_human(message: Message, bot: Bot) -> None:
@@ -909,9 +927,10 @@ def build_dispatcher(services: Services) -> Dispatcher:
                     except Exception:
                         logger.exception("Reference org lookup failed for %s", message.from_user.id)
             if values:
+                prefer_name_match = mode == "new" or _is_new_hire_trigger(message.text)
                 await _save_profile_values(
                     message, services, values, message.text, require_existing=mode == "update",
-                    extra_fields=extra_fields,
+                    extra_fields=extra_fields, prefer_name_match=prefer_name_match,
                 )
                 return
         if services.settings.wallet_workflow_enabled and _is_wallet_completion(message.text):

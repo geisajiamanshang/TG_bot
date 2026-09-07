@@ -45,6 +45,7 @@ class VisionService:
                             + "如果截图里出现了试用期薪资或转正后薪资的具体数字，分别提取到trial_salary/confirmed_salary，"
                             + "只保留阿拉伯数字，把\"10k\"\"1万\"这类缩写换算成完整数字（10k→10000，1万→10000），不要加货币符号、单位或逗号，看不清就留空。"
                             + "如果截图里明确写出了直接上级/汇报对象是谁，原样摘录姓名到direct_supervisor，看不清就留空。"
+                            + "如果截图里用“候选人姓名”来称呼候选人/新人姓名，与“姓名/简历名”是同一个字段，同样提取到resume_name，不要单独处理或留空。"
                         ),
                     },
                     {"type": "input_image", "image_url": data_url, "detail": "high"},

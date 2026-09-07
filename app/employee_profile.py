@@ -11,6 +11,7 @@ FIELD_LABELS = {
     "花名": "chinese_name",
     "姓名/简历名": "resume_name",
     "简历名": "resume_name",
+    "候选人姓名": "resume_name",
     "在职状态": "employment_status",
     "生效日期": "effective_date",
     "生效日期(入职日如2026-06-01)": "effective_date",

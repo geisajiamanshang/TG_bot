@@ -124,8 +124,11 @@ class GoogleSheetsService:
         changes: dict[str, tuple[str, str]],
         is_new: bool,
         extra_fields: dict[str, str] | None = None,
+        prefer_name_match: bool = False,
     ) -> int:
-        return await asyncio.to_thread(self._sync_profile, profile, changes, is_new, extra_fields)
+        return await asyncio.to_thread(
+            self._sync_profile, profile, changes, is_new, extra_fields, prefer_name_match
+        )
 
     def _read_rows(self, service, sheet: str, range_: str, spreadsheet_id: str | None = None) -> list[list[object]]:
         result = service.spreadsheets().values().get(
@@ -174,28 +177,49 @@ class GoogleSheetsService:
         changes: dict[str, tuple[str, str]],
         is_new: bool,
         extra_fields: dict[str, str] | None = None,
+        prefer_name_match: bool = False,
     ) -> int:
         service = self._service()
         rows = self._read_rows(service, ROSTER_SHEET, "A4:AF")
-        employee_code = str(profile["employee_code"])
+        employee_code = str(profile.get("employee_code") or "")
         target_row = 0
-        for offset, row in enumerate(rows):
-            if len(row) > 1 and str(row[1]).strip() == employee_code:
-                target_row = ROSTER_START_ROW + offset
-                break
+        matched_by_name = False
+        # For "入职信息确认"/"新人入职" submissions (prefer_name_match=True), HR may already have
+        # a placeholder row keyed only by candidate name (姓名/简历名，即候选人姓名) before an
+        # employee code exists -- e.g. created earlier during offer approval. Look that up FIRST
+        # so we keep filling the same row instead of creating a duplicate. Only act on a single
+        # unambiguous match; never guess between same-name rows.
+        if prefer_name_match:
+            resume_name = str(profile.get("resume_name") or "").strip()
+            if resume_name:
+                name_matches = [
+                    ROSTER_START_ROW + offset
+                    for offset, row in enumerate(rows)
+                    if len(row) > 3 and str(row[3]).strip().casefold() == resume_name.casefold()
+                ]
+                if len(name_matches) == 1:
+                    target_row = name_matches[0]
+                    matched_by_name = True
+        if not target_row and employee_code:
+            for offset, row in enumerate(rows):
+                if len(row) > 1 and str(row[1]).strip() == employee_code:
+                    target_row = ROSTER_START_ROW + offset
+                    break
         row_already_exists = bool(target_row)
         if not target_row:
             target_row = self._last_used_row(rows, ROSTER_START_ROW) + 1
             self._ensure_rows(service, ROSTER_SHEET_ID, target_row)
 
         updates: list[dict[str, object]] = []
-        effective_new = is_new and not row_already_exists
-        if effective_new:
+        # A brand-new row and an existing placeholder row located purely by candidate name both
+        # need every field written; only a genuine employee-code match (an existing, already
+        # filled-in employee) should stay a diff-only update. Only a truly new row (not a
+        # name-matched placeholder) gets a freshly assigned serial number in column A.
+        effective_new = is_new and (not row_already_exists or matched_by_name)
+        if is_new and not row_already_exists:
             sequence_values = [int(str(row[0])) for row in rows if row and str(row[0]).isdigit()]
             updates.append({"range": f"'{ROSTER_SHEET}'!A{target_row}", "values": [[max(sequence_values, default=0) + 1]]})
-            keys = ROSTER_COLUMNS.keys()
-        else:
-            keys = changes.keys()
+        keys = ROSTER_COLUMNS.keys() if effective_new else changes.keys()
         for key in keys:
             column = ROSTER_COLUMNS.get(key)
             if column:
