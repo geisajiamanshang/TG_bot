@@ -278,12 +278,12 @@ async def _save_profile_values(
     if values.get("employee_code"):
         conflict = await services.db.profile_by_employee_code(values["employee_code"])
         if conflict and int(conflict["telegram_user_id"]) != message.from_user.id:
-            if not is_new_hire_event:
-                await message.answer("这个员工编码已经绑定其他 Telegram 账号，请联系管理员处理。")
-                return False
-            # "新人入职"/"信息确认" 场景：不管这次是本人自助提交，还是 HR/管理员代发消息或
-            # 截图，都以员工编码为准 —— 合并写入该编码原来绑定的那条本地档案（保留其原有的
-            # Telegram 归属，只更新字段），而不是被旧的账号绑定拦住或另建一行。
+            # 员工编码是唯一识别符：不管这次发消息/截图的是本人（换设备、重新登录后
+            # telegram_user_id 变了）、HR/管理员代发，还是本人后续用自己账号继续确认/
+            # 更新——只要编码对得上，就都合并写入这个编码已经绑定的那条本地档案（保留其
+            # 原有的 Telegram 归属信息，只更新字段），而不是新建一行或者拦截报错。
+            # 这样无论是谁、发多少次、用哪个账号发，都能正确写入/覆盖同一条员工记录，
+            # 不会出现"这个员工编码已经绑定其他 Telegram 账号"把本人自己都拦在外面的情况。
             existing = conflict
             target_user_id = int(conflict["telegram_user_id"])
             target_username = str(conflict.get("telegram_username") or "") or target_username
