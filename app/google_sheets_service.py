@@ -49,6 +49,17 @@ EXTRA_HR_DEFAULT_COLUMNS = {
     "latest_change_type": "BE", "latest_change_reason": "BF", "latest_change_date": "BG",
 }
 
+# Fixed HR business-rule defaults (app/hr_defaults.py) that must never be written onto a
+# row this call didn't just create or first-fill (see effective_new below). This is every
+# EXTRA_HR_DEFAULT_COLUMNS key, plus "job_sequence"/"service_entity" (序列/服务单位) --
+# those two are classified under EXTRA_ORG_COLUMNS instead (so find_reference_org_fields
+# can still copy them between existing rows), but hr_defaults also fixes them to constant
+# values for a brand-new hire, so they need the same never-overwrite-an-existing-row
+# protection: without it, a duplicate "新人入职"/"入职信息确认" resend that happens to
+# match an already-filled existing employee row (by employee_code) would clobber that
+# row's 序列/服务单位 with the blind defaults "派驻"/"恒睿".
+NEW_HIRE_ONLY_EXTRA_KEYS = frozenset(EXTRA_HR_DEFAULT_COLUMNS) | {"job_sequence", "service_entity"}
+
 
 class GoogleSheetsService:
     def __init__(
@@ -231,6 +242,11 @@ class GoogleSheetsService:
             updates.append({"range": f"'{ROSTER_SHEET}'!AQ{target_row}", "values": [[str(profile.get('effective_date') or '')]]})
         if extra_fields:
             for extra_key, extra_value in extra_fields.items():
+                # Fixed HR business-rule defaults (app/hr_defaults.py) are only ever meant
+                # for a brand-new roster row -- never let them overwrite a field HR has
+                # since edited on an existing employee's row.
+                if extra_key in NEW_HIRE_ONLY_EXTRA_KEYS and not effective_new:
+                    continue
                 extra_column = (
                     EXTRA_ORG_COLUMNS.get(extra_key)
                     or EXTRA_SALARY_COLUMNS.get(extra_key)

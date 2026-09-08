@@ -36,6 +36,7 @@ from app.employee_profile import (
 from app.google_sheets_service import GoogleSheetsService
 from app.gpt_service import GPTService
 from app.vision_service import VisionService
+from app import hr_defaults
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +118,38 @@ def _is_new_hire_trigger(text: str) -> bool:
         return False
     head = text[:80]
     return "入职信息确认" in head or "新人入职" in head
+
+
+def _apply_new_hire_defaults(
+    values: dict[str, str], extra_fields: dict[str, str], org_hint: str
+) -> None:
+    """花名册/变更记录 填写规范 (2026-09-06): fixed HR business-rule defaults for a genuine
+    new-hire submission. Only ever fills a gap or normalizes an already-given value -- never
+    overrides anything explicitly present. Callers must only invoke this once the submission
+    is confirmed to be a new hire (入职信息确认/新人入职), never for a plain 字段变更 update."""
+    if values.get("chinese_name") and not values.get("resume_name"):
+        values["resume_name"] = values["chinese_name"]
+    elif values.get("resume_name") and not values.get("chinese_name"):
+        values["chinese_name"] = values["resume_name"]
+    values["nationality"] = hr_defaults.default_nationality(values.get("nationality", ""))
+    values["office_region"] = hr_defaults.default_office_region(values.get("office_region", ""))
+    values.setdefault("employment_status", "试用期")
+    for key, default_value in hr_defaults.NEW_HIRE_STATIC_DEFAULTS.items():
+        extra_fields.setdefault(key, default_value)
+    extra_fields.setdefault("salary_currency", "CNY")
+    if not extra_fields.get("hrbp"):
+        hrbp = hr_defaults.resolve_hrbp(
+            extra_fields.get("department", ""), extra_fields.get("team", ""), org_hint
+        )
+        if hrbp:
+            extra_fields["hrbp"] = hrbp
+    effective_date = values.get("effective_date", "")
+    if effective_date:
+        extra_fields.setdefault("latest_change_date", effective_date)
+        if not extra_fields.get("probation_end_date"):
+            end_date = hr_defaults.probation_end_date(effective_date)
+            if end_date:
+                extra_fields["probation_end_date"] = end_date
 
 
 def _wallet_packet(profile: dict[str, object], result: dict[str, str]) -> str:
@@ -231,27 +264,39 @@ async def _save_profile_values(
     allow_incomplete: bool = False,
     extra_fields: dict[str, str] | None = None,
     prefer_name_match: bool = False,
+    is_new_hire_event: bool = False,
 ) -> bool:
     if not message.from_user:
         return False
-    existing = await services.db.profile(message.from_user.id)
+    target_user_id = message.from_user.id
+    target_username = message.from_user.username
+    target_full_name = message.from_user.full_name
+    existing = await services.db.profile(target_user_id)
     if require_existing and not existing:
         await message.answer("还没有找到你的员工档案。请先提交完整的新人入职信息。")
         return False
     if values.get("employee_code"):
         conflict = await services.db.profile_by_employee_code(values["employee_code"])
         if conflict and int(conflict["telegram_user_id"]) != message.from_user.id:
-            await message.answer("这个员工编码已经绑定其他 Telegram 账号，请联系管理员处理。")
-            return False
+            if not is_new_hire_event:
+                await message.answer("这个员工编码已经绑定其他 Telegram 账号，请联系管理员处理。")
+                return False
+            # "新人入职"/"信息确认" 场景：不管这次是本人自助提交，还是 HR/管理员代发消息或
+            # 截图，都以员工编码为准 —— 合并写入该编码原来绑定的那条本地档案（保留其原有的
+            # Telegram 归属，只更新字段），而不是被旧的账号绑定拦住或另建一行。
+            existing = conflict
+            target_user_id = int(conflict["telegram_user_id"])
+            target_username = str(conflict.get("telegram_username") or "") or target_username
+            target_full_name = str(conflict.get("telegram_full_name") or "") or target_full_name
     errors = validate_profile(values, is_new=existing is None and not allow_incomplete)
     if errors:
         await message.answer("信息暂未保存：\n- " + "\n- ".join(errors))
         return False
     try:
         saved, changes, is_new = await services.db.save_profile(
-            message.from_user.id,
-            message.from_user.username,
-            message.from_user.full_name,
+            target_user_id,
+            target_username,
+            target_full_name,
             values,
             raw_message,
         )
@@ -268,12 +313,12 @@ async def _save_profile_values(
             row = await services.sheets.sync_profile(
                 saved, changes, is_new, extra_fields, prefer_name_match
             )
-            await services.db.set_profile_sync(message.from_user.id, "synced", row)
+            await services.db.set_profile_sync(target_user_id, "synced", row)
             saved["sync_status"] = "synced"
             sync_note = f"已同步到花名册第 {row} 行，并写入变更记录。"
         except Exception as exc:
-            logger.exception("Google Sheets sync failed for %s", message.from_user.id)
-            await services.db.set_profile_sync(message.from_user.id, f"error: {str(exc)}")
+            logger.exception("Google Sheets sync failed for %s", target_user_id)
+            await services.db.set_profile_sync(target_user_id, f"error: {str(exc)}")
             sync_note = "本地已保存，但云表同步失败，管理员可检查后重试。"
     changed_labels = "、".join(DISPLAY_LABELS.get(key, key) for key in changes)
     await message.answer(
@@ -866,6 +911,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
         org_hint = values.pop("org_hint", "")
         trial_salary = values.pop("trial_salary", "")
         confirmed_salary = values.pop("confirmed_salary", "")
+        direct_supervisor = values.pop("direct_supervisor", "")
         values = clean_screenshot_values(values)
         if not values.get("employee_code") and not values.get("resume_name"):
             await message.answer("其他缺失字段可以留空，但必须能识别员工编码或候选人姓名/姓名/简历名，用于防止写错员工。请补充其中之一。")
@@ -882,6 +928,10 @@ def build_dispatcher(services: Services) -> Dispatcher:
                 extra_fields.update(await services.sheets.find_reference_org_fields(org_hint))
             except Exception:
                 logger.exception("Reference org lookup failed for %s", message.from_user.id)
+        if direct_supervisor:
+            extra_fields["direct_supervisor"] = direct_supervisor
+        # 管理员发送的截图始终是"入职信息确认"场景，按新人入职套用花名册/变更记录填写规范的固定默认值。
+        _apply_new_hire_defaults(values, extra_fields, org_hint)
         raw = "[截图识别]\n" + "\n".join(
             f"{DISPLAY_LABELS.get(key, key)}：{value}" for key, value in values.items()
         )
@@ -890,7 +940,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
         # 而不是新建重复行。
         await _save_profile_values(
             message, services, values, raw, allow_incomplete=True,
-            extra_fields=extra_fields, prefer_name_match=True,
+            extra_fields=extra_fields, prefer_name_match=True, is_new_hire_event=True,
         )
 
     @router.message(F.text)
@@ -903,6 +953,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
         mode, values = parse_profile_message(message.text)
         if mode:
             extra_fields: dict[str, str] = {}
+            org_hint = ""
             if services.settings.openai_api_key:
                 try:
                     gpt_values = await services.gpt.extract_profile_from_text(message.text)
@@ -912,6 +963,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
                 org_hint = gpt_values.pop("org_hint", "")
                 trial_salary = gpt_values.pop("trial_salary", "")
                 confirmed_salary = gpt_values.pop("confirmed_salary", "")
+                direct_supervisor = gpt_values.pop("direct_supervisor", "")
                 gpt_values = clean_screenshot_values(gpt_values)
                 for key, value in gpt_values.items():
                     values.setdefault(key, value)
@@ -926,11 +978,17 @@ def build_dispatcher(services: Services) -> Dispatcher:
                         extra_fields.update(await services.sheets.find_reference_org_fields(org_hint))
                     except Exception:
                         logger.exception("Reference org lookup failed for %s", message.from_user.id)
+                if direct_supervisor:
+                    extra_fields["direct_supervisor"] = direct_supervisor
+            is_new_hire_event = mode == "new" or _is_new_hire_trigger(message.text)
+            if is_new_hire_event:
+                _apply_new_hire_defaults(values, extra_fields, org_hint)
             if values:
-                prefer_name_match = mode == "new" or _is_new_hire_trigger(message.text)
+                prefer_name_match = is_new_hire_event
                 await _save_profile_values(
                     message, services, values, message.text, require_existing=mode == "update",
                     extra_fields=extra_fields, prefer_name_match=prefer_name_match,
+                    is_new_hire_event=is_new_hire_event,
                 )
                 return
         if services.settings.wallet_workflow_enabled and _is_wallet_completion(message.text):
