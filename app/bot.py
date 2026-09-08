@@ -275,19 +275,19 @@ async def _save_profile_values(
     if require_existing and not existing:
         await message.answer("还没有找到你的员工档案。请先提交完整的新人入职信息。")
         return False
-    if values.get("employee_code"):
-        conflict = await services.db.profile_by_employee_code(values["employee_code"])
-        if conflict and int(conflict["telegram_user_id"]) != message.from_user.id:
-            # 员工编码是唯一识别符：不管这次发消息/截图的是本人（换设备、重新登录后
-            # telegram_user_id 变了）、HR/管理员代发，还是本人后续用自己账号继续确认/
-            # 更新——只要编码对得上，就都合并写入这个编码已经绑定的那条本地档案（保留其
-            # 原有的 Telegram 归属信息，只更新字段），而不是新建一行或者拦截报错。
-            # 这样无论是谁、发多少次、用哪个账号发，都能正确写入/覆盖同一条员工记录，
-            # 不会出现"这个员工编码已经绑定其他 Telegram 账号"把本人自己都拦在外面的情况。
-            existing = conflict
-            target_user_id = int(conflict["telegram_user_id"])
-            target_username = str(conflict.get("telegram_username") or "") or target_username
-            target_full_name = str(conflict.get("telegram_full_name") or "") or target_full_name
+    # 花名册填写规范：忽略"候选人编码"，"姓名/简历名" == 候选人姓名才是唯一识别符。
+    # 不管这次发消息/截图的是本人、HR/管理员代发，还是本人后续用别的账号继续确认/更新——
+    # 只要候选人姓名和本地已有档案的姓名/简历名一致，就认定是同一个人，合并覆盖写入那条
+    # 记录（保留其原有的 Telegram 归属信息，只更新字段），而不是新建一行；姓名对不上，就
+    # 按新档案重新填写，不会误覆盖别人的记录。
+    candidate_name = str(values.get("chinese_name") or values.get("resume_name") or "").strip()
+    if candidate_name:
+        match = await services.db.profile_by_name(candidate_name)
+        if match and int(match["telegram_user_id"]) != message.from_user.id:
+            existing = match
+            target_user_id = int(match["telegram_user_id"])
+            target_username = str(match.get("telegram_username") or "") or target_username
+            target_full_name = str(match.get("telegram_full_name") or "") or target_full_name
     errors = validate_profile(values, is_new=existing is None and not allow_incomplete)
     if errors:
         await message.answer("信息暂未保存：\n- " + "\n- ".join(errors))

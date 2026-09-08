@@ -73,7 +73,7 @@ class Database:
                     telegram_user_id INTEGER PRIMARY KEY,
                     telegram_username TEXT,
                     telegram_full_name TEXT NOT NULL,
-                    employee_code TEXT NOT NULL UNIQUE,
+                    employee_code TEXT NOT NULL DEFAULT '',
                     chinese_name TEXT NOT NULL,
                     resume_name TEXT NOT NULL,
                     employment_status TEXT,
@@ -137,6 +137,47 @@ class Database:
                   );
                 """
             )
+            # 花名册填写规范更新：候选人编码不再是唯一识别符（改为按"姓名/简历名"匹配），
+            # 所以本地表也不应该再对 employee_code 强制 UNIQUE —— 否则不同候选人恰好编码
+            # 相同/都留空时会在写入时报 "UNIQUE constraint failed" 而丢失数据。已经存在的
+            # 旧库（建表时还带着 UNIQUE 约束）在这里做一次性迁移去掉它，保留全部数据。
+            existing_sql_row = await (await db.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'employee_profiles'"
+            )).fetchone()
+            existing_sql = str(existing_sql_row[0]) if existing_sql_row and existing_sql_row[0] else ""
+            if "employee_code" in existing_sql and "UNIQUE" in existing_sql:
+                await db.executescript(
+                    """
+                    ALTER TABLE employee_profiles RENAME TO employee_profiles_pre_unique_migration;
+                    CREATE TABLE employee_profiles (
+                        telegram_user_id INTEGER PRIMARY KEY,
+                        telegram_username TEXT,
+                        telegram_full_name TEXT NOT NULL,
+                        employee_code TEXT NOT NULL DEFAULT '',
+                        chinese_name TEXT NOT NULL,
+                        resume_name TEXT NOT NULL,
+                        employment_status TEXT,
+                        effective_date TEXT NOT NULL,
+                        gender TEXT,
+                        age_range TEXT,
+                        education TEXT,
+                        nationality TEXT,
+                        birthday_month TEXT,
+                        office_region TEXT,
+                        work_tg TEXT,
+                        private_contact TEXT,
+                        work_email TEXT,
+                        raw_message TEXT NOT NULL,
+                        sheet_row INTEGER,
+                        sync_status TEXT NOT NULL DEFAULT 'pending',
+                        deleted INTEGER NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    INSERT INTO employee_profiles SELECT * FROM employee_profiles_pre_unique_migration;
+                    DROP TABLE employee_profiles_pre_unique_migration;
+                    """
+                )
             columns = {
                 str(row[1])
                 for row in await (await db.execute("PRAGMA table_info(feedback)")).fetchall()
@@ -210,6 +251,24 @@ class Database:
             row = await (await db.execute(
                 "SELECT * FROM employee_profiles WHERE employee_code = ? AND deleted = 0",
                 (employee_code,),
+            )).fetchone()
+            return dict(row) if row else None
+
+    async def profile_by_name(self, name: str) -> dict[str, object] | None:
+        """花名册填写规范：忽略候选人编码，"姓名/简历名" == 候选人姓名 才是唯一识别符。
+        Matches an existing (non-deleted) profile whose stored chinese_name or
+        resume_name equals the given candidate name (trimmed, case-insensitive).
+        Returns the most recently updated match if more than one row somehow ties."""
+        normalized = name.strip()
+        if not normalized:
+            return None
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            row = await (await db.execute(
+                "SELECT * FROM employee_profiles WHERE deleted = 0 AND "
+                "(LOWER(TRIM(chinese_name)) = LOWER(TRIM(?)) OR LOWER(TRIM(resume_name)) = LOWER(TRIM(?))) "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (normalized, normalized),
             )).fetchone()
             return dict(row) if row else None
 
