@@ -617,6 +617,21 @@ class Database:
                 return None
             return int(row[0]), str(row[1]), str(row[2]), bool(row[3])
 
+    async def template_by_name(self, name: str) -> tuple[int, str, str, bool] | None:
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                """
+                SELECT id, name, content, auto_send_to_new
+                FROM notification_templates
+                WHERE name = ? AND active = 1
+                """,
+                (name,),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            return int(row[0]), str(row[1]), str(row[2]), bool(row[3])
+
     async def delete_template(self, template_id: int) -> None:
         async with aiosqlite.connect(self.path) as db:
             await db.execute(

@@ -86,6 +86,11 @@ class Broadcast(StatesGroup):
     waiting_for_confirmation = State()
 
 
+class AttendanceCheck(StatesGroup):
+    waiting_for_screenshot = State()
+    waiting_for_confirmation = State()
+
+
 class TemplateCreate(StatesGroup):
     waiting_for_name = State()
     waiting_for_content = State()
@@ -177,6 +182,14 @@ CONTACTS_PER_PAGE = 8
 def _employee_label(employee: Employee) -> str:
     username = f"@{employee.username}" if employee.username else "无 username"
     return f"{employee.full_name} · {username} · {employee.telegram_user_id}"
+
+
+async def _download_message_image(message: Message, bot: Bot) -> tuple[bytes, str]:
+    file_id = message.photo[-1].file_id if message.photo else message.document.file_id
+    mime_type = message.document.mime_type if message.document else "image/jpeg"
+    buffer = io.BytesIO()
+    await bot.download(file_id, destination=buffer)
+    return buffer.getvalue(), mime_type or "image/jpeg"
 
 
 def _selection_keyboard(
@@ -927,6 +940,220 @@ def build_dispatcher(services: Services) -> Dispatcher:
             await _send_employee_list(callback.message, "✅ 发送成功名单", successful)
             await _send_employee_list(callback.message, "❌ 发送失败名单", failed)
 
+    @router.message(Command("attendance_check"))
+    async def attendance_check_start(message: Message, state: FSMContext) -> None:
+        if not message.from_user or not _is_admin(message.from_user.id, services.settings):
+            await message.answer("无权使用此命令。")
+            return
+        if not services.settings.openai_api_key or not services.sheets.configured:
+            await message.answer("截图识别或 Google 花名册尚未配置，暂时无法执行考勤抽查。")
+            return
+        attendance_template = await services.db.template_by_name("考勤抽查")
+        activation_template = await services.db.template_by_name("激活机器人")
+        if not attendance_template or not activation_template:
+            await message.answer("缺少启用中的“考勤抽查”或“激活机器人”模板，请先补充模板。")
+            return
+        await state.clear()
+        await state.set_state(AttendanceCheck.waiting_for_screenshot)
+        await state.update_data(
+            attendance_template_id=attendance_template[0],
+            activation_template_id=activation_template[0],
+        )
+        await message.answer(
+            "请发送包含员工花名的考勤截图。机器人会核对花名册 C 列花名和 AD 列工作 TG。\n\n"
+            "识别后只生成发送预览；在您确认前不会发送任何消息。发送 /cancel 可取消。"
+        )
+
+    @router.message(
+        AttendanceCheck.waiting_for_screenshot,
+        F.photo | (F.document & F.document.mime_type.startswith("image/")),
+    )
+    async def attendance_check_screenshot(message: Message, state: FSMContext, bot: Bot) -> None:
+        if not message.from_user or not _is_admin(message.from_user.id, services.settings):
+            await state.clear()
+            return
+        if message.document and message.document.file_size and message.document.file_size > 10 * 1024 * 1024:
+            await message.answer("图片文件过大，请压缩到 10 MB 以内后重试。")
+            return
+        await message.answer("正在识别花名并核对花名册，请稍候……")
+        try:
+            image, mime_type = await _download_message_image(message, bot)
+            names = await services.vision.extract_attendance_names(image, mime_type)
+            if not names:
+                await message.answer("没有识别到人员花名，请发送更清晰、完整的截图。")
+                return
+            sheet_results = await services.sheets.attendance_contacts(names)
+        except Exception:
+            logger.exception("Attendance screenshot processing failed for %s", message.from_user.id)
+            await message.answer("截图识别或花名册核对失败；当前未发送任何消息。")
+            return
+
+        employees = await services.db.active_employees()
+        employee_by_username = {
+            employee.username.strip().lstrip("@").casefold(): employee
+            for employee in employees if employee.username and employee.username.strip().lstrip("@")
+        }
+        attendance_targets: list[dict[str, object]] = []
+        activation_targets: list[dict[str, str]] = []
+        issues: list[str] = []
+        for result in sheet_results:
+            name = str(result.get("chinese_name") or result.get("requested_name") or "")
+            status = str(result.get("status") or "")
+            if status == "not_found":
+                issues.append(f"{name}：花名册 C 列未找到")
+                continue
+            if status == "missing_tg":
+                issues.append(f"{name}：AD 列工作 TG 为空")
+                continue
+            if status == "ambiguous":
+                issues.append(f"{name}：同名行的 AD 列不一致，需人工核对")
+                continue
+            work_tg = str(result.get("work_tg") or "")
+            employee = employee_by_username.get(work_tg.lstrip("@").casefold())
+            if employee:
+                attendance_targets.append({
+                    "telegram_user_id": employee.telegram_user_id,
+                    "chinese_name": name,
+                    "work_tg": work_tg,
+                })
+            else:
+                activation_targets.append({"chinese_name": name, "work_tg": work_tg})
+
+        state_data = await state.get_data()
+        attendance_template = await services.db.template(int(state_data.get("attendance_template_id") or 0))
+        activation_template = await services.db.template(int(state_data.get("activation_template_id") or 0))
+        if not attendance_template or not activation_template:
+            await state.clear()
+            await message.answer("考勤相关模板已失效；当前未发送任何消息。")
+            return
+        await state.update_data(
+            attendance_targets=attendance_targets,
+            activation_targets=activation_targets,
+        )
+        lines = [
+            "【考勤抽查发送预览】",
+            f"截图识别：{len(names)} 人",
+            f"已登记，可发送考勤模板：{len(attendance_targets)} 人",
+            f"未登记，需发送激活模板：{len(activation_targets)} 人",
+            f"异常：{len(issues)} 人",
+        ]
+        if attendance_targets:
+            lines.append("\n考勤抽查名单：\n" + "\n".join(
+                f"{index}. {item['chinese_name']} · {item['work_tg']}"
+                for index, item in enumerate(attendance_targets, 1)
+            ))
+            lines.append(f"\n考勤模板：\n{attendance_template[2]}")
+        if activation_targets:
+            lines.append("\n未登记名单：\n" + "\n".join(
+                f"{index}. {item['chinese_name']} · {item['work_tg']}"
+                for index, item in enumerate(activation_targets, 1)
+            ))
+            lines.append(
+                f"\n激活模板：\n{activation_template[2]}\n"
+                "提示：Telegram 不允许机器人主动私聊从未 /start 的用户；确认后会生成可点击的人工转发清单。"
+            )
+        if issues:
+            lines.append("\n未进入发送范围：\n" + "\n".join(issues))
+        if not attendance_targets and not activation_targets:
+            await state.set_state(AttendanceCheck.waiting_for_screenshot)
+            await message.answer("\n".join(lines)[:3900] + "\n\n没有可处理对象，请核对后重新发送截图。")
+            return
+        await state.set_state(AttendanceCheck.waiting_for_confirmation)
+        await message.answer(
+            "\n".join(lines)[:3900],
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="确认执行", callback_data="attendance:confirm"),
+                InlineKeyboardButton(text="取消", callback_data="attendance:cancel"),
+            ]]),
+        )
+
+    @router.callback_query(F.data == "attendance:cancel")
+    async def attendance_check_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+        if not callback.from_user or not _is_admin(callback.from_user.id, services.settings):
+            await callback.answer("无权操作", show_alert=True)
+            return
+        await state.clear()
+        await callback.answer("已取消")
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
+
+    @router.callback_query(AttendanceCheck.waiting_for_confirmation, F.data == "attendance:confirm")
+    async def attendance_check_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+        if not callback.from_user or not _is_admin(callback.from_user.id, services.settings):
+            await callback.answer("无权操作", show_alert=True)
+            return
+        data = await state.get_data()
+        targets = list(data.get("attendance_targets") or [])
+        activation_targets = list(data.get("activation_targets") or [])
+        attendance_template = await services.db.template(int(data.get("attendance_template_id") or 0))
+        activation_template = await services.db.template(int(data.get("activation_template_id") or 0))
+        if not attendance_template or not activation_template:
+            await state.clear()
+            await callback.answer("模板已经失效", show_alert=True)
+            return
+        await state.clear()
+        await callback.answer("开始执行")
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.message.answer("已获得您的确认，正在发送考勤抽查……")
+
+        recipients = await services.db.active_employees_by_ids(
+            [int(item["telegram_user_id"]) for item in targets]
+        )
+        target_by_id = {int(item["telegram_user_id"]): item for item in targets}
+        successful: list[Employee] = []
+        failed: list[Employee] = []
+        delay = 1 / services.settings.broadcast_messages_per_second
+        for employee in recipients:
+            try:
+                await bot.send_message(employee.chat_id, attendance_template[2])
+                successful.append(employee)
+            except TelegramRetryAfter as exc:
+                await asyncio.sleep(exc.retry_after + 0.5)
+                try:
+                    await bot.send_message(employee.chat_id, attendance_template[2])
+                    successful.append(employee)
+                except Exception:
+                    logger.exception("Attendance retry failed for user %s", employee.telegram_user_id)
+                    failed.append(employee)
+            except (TelegramForbiddenError, TelegramBadRequest):
+                await services.db.deactivate_employee(employee.telegram_user_id)
+                failed.append(employee)
+            except Exception:
+                logger.exception("Attendance send failed for user %s", employee.telegram_user_id)
+                failed.append(employee)
+            await asyncio.sleep(delay)
+
+        broadcast_id = await services.db.save_broadcast(
+            callback.from_user.id, f"[考勤抽查]\n{attendance_template[2]}", len(successful), len(failed)
+        )
+        if callback.message:
+            report = [
+                f"考勤抽查执行完成。记录 #{broadcast_id}",
+                f"考勤模板发送成功：{len(successful)}",
+                f"发送失败：{len(failed)}",
+            ]
+            if successful:
+                report.append("\n✅ 发送成功：\n" + "\n".join(
+                    f"{target_by_id[item.telegram_user_id]['chinese_name']} · "
+                    f"{target_by_id[item.telegram_user_id]['work_tg']}" for item in successful
+                ))
+            if failed:
+                report.append("\n❌ 发送失败：\n" + "\n".join(
+                    f"{target_by_id[item.telegram_user_id]['chinese_name']} · "
+                    f"{target_by_id[item.telegram_user_id]['work_tg']}" for item in failed
+                ))
+            if activation_targets:
+                links = "\n".join(
+                    f"{item['chinese_name']}：https://t.me/{str(item['work_tg']).lstrip('@')}"
+                    for item in activation_targets
+                )
+                report.append(
+                    f"\n⚠️ 以下员工从未激活机器人，机器人无法主动私聊。请人工转发：\n"
+                    f"{activation_template[2]}\n\n{links}"
+                )
+            await callback.message.answer("\n".join(report)[:3900])
+
     @router.message(F.photo | (F.document & F.document.mime_type.startswith("image/")))
     async def profile_screenshot(message: Message, bot: Bot) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
@@ -1130,6 +1357,7 @@ ADMIN_COMMANDS = [
     BotCommand(command="cancel", description="取消当前操作"),
     BotCommand(command="profiles", description="管理员查看员工档案"),
     BotCommand(command="broadcast", description="管理员群发通知"),
+    BotCommand(command="attendance_check", description="管理员截图发起考勤抽查"),
     BotCommand(command="templates", description="管理员使用通知模板"),
     BotCommand(command="template_add", description="管理员创建或更新模板"),
     BotCommand(command="stats", description="管理员查看统计"),

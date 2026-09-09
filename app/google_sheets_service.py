@@ -184,6 +184,68 @@ class GoogleSheetsService:
         ).execute()
         return result.get("values", [])
 
+    async def attendance_contacts(self, chinese_names: list[str]) -> list[dict[str, str]]:
+        """Read-only lookup: match 花名册 C 花名 and return AD 工作TG."""
+        return await asyncio.to_thread(self._attendance_contacts, chinese_names)
+
+    def _attendance_contacts(self, chinese_names: list[str]) -> list[dict[str, str]]:
+        service = self._service()
+        rows = self._read_rows(service, ROSTER_SHEET, "C4:AD5000")
+
+        def key(value: object) -> str:
+            return "".join(str(value or "").split()).casefold()
+
+        by_name: dict[str, list[tuple[int, str, str]]] = {}
+        for row_number, row in enumerate(rows, start=ROSTER_START_ROW):
+            flower_name = str(row[0] if row else "").strip()
+            if not flower_name:
+                continue
+            # C:AD contains 28 columns; AD is offset 27 from C.
+            work_tg = str(row[27] if len(row) > 27 else "").strip()
+            by_name.setdefault(key(flower_name), []).append(
+                (row_number, flower_name, work_tg)
+            )
+
+        results: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for requested_name in chinese_names:
+            normalized = key(requested_name)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            candidates = by_name.get(normalized, [])
+            if not candidates:
+                results.append({"requested_name": requested_name, "status": "not_found"})
+                continue
+            usernames = {
+                work_tg.lstrip("@").strip().casefold()
+                for _, _, work_tg in candidates if work_tg.lstrip("@").strip()
+            }
+            if not usernames:
+                results.append({
+                    "requested_name": requested_name,
+                    "chinese_name": candidates[-1][1],
+                    "status": "missing_tg",
+                })
+                continue
+            if len(usernames) > 1:
+                results.append({
+                    "requested_name": requested_name,
+                    "chinese_name": candidates[-1][1],
+                    "status": "ambiguous",
+                })
+                continue
+            username = next(iter(usernames))
+            matching = next(item for item in reversed(candidates) if item[2].lstrip("@").strip().casefold() == username)
+            results.append({
+                "requested_name": requested_name,
+                "chinese_name": matching[1],
+                "work_tg": f"@{username}",
+                "row": str(matching[0]),
+                "status": "matched",
+            })
+        return results
+
     @staticmethod
     def _last_used_row(rows: list[list[object]], start_row: int) -> int:
         last = start_row - 1
