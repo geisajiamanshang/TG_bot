@@ -272,6 +272,23 @@ class Database:
             )).fetchone()
             return dict(row) if row else None
 
+    async def roster_by_name(self, name: str) -> dict[str, object] | None:
+        """考勤抽查名单比对：在本地同步的花名册（roster，只读，来自 /sync）里按
+        花名（chinese_name）或姓名/简历名（resume_name）查找，忽略大小写和首尾空格。
+        多条同名只取第一条，仅用于确认"这个花名是否是花名册里的真实员工"。"""
+        normalized = name.strip()
+        if not normalized:
+            return None
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            row = await (await db.execute(
+                "SELECT * FROM roster WHERE "
+                "(LOWER(TRIM(chinese_name)) = LOWER(TRIM(?)) OR LOWER(TRIM(resume_name)) = LOWER(TRIM(?))) "
+                "LIMIT 1",
+                (normalized, normalized),
+            )).fetchone()
+            return dict(row) if row else None
+
     async def save_profile(
         self,
         telegram_user_id: int,
