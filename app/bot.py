@@ -88,7 +88,6 @@ class Broadcast(StatesGroup):
 
 class AttendanceCheck(StatesGroup):
     waiting_for_screenshot = State()
-    waiting_for_confirmation = State()
 
 
 class TemplateCreate(StatesGroup):
@@ -958,6 +957,10 @@ def build_dispatcher(services: Services) -> Dispatcher:
         await state.update_data(
             attendance_template_id=attendance_template[0],
             activation_template_id=activation_template[0],
+            attendance_targets=[],
+            activation_targets=[],
+            attendance_issues=[],
+            attendance_names=[],
         )
         await message.answer(
             "请发送包含员工花名的考勤截图。机器人会核对花名册 C 列花名和 AD 列工作 TG。\n\n"
@@ -993,9 +996,23 @@ def build_dispatcher(services: Services) -> Dispatcher:
             employee.username.strip().lstrip("@").casefold(): employee
             for employee in employees if employee.username and employee.username.strip().lstrip("@")
         }
-        attendance_targets: list[dict[str, object]] = []
-        activation_targets: list[dict[str, str]] = []
-        issues: list[str] = []
+        state_data = await state.get_data()
+        attendance_by_id = {
+            int(item["telegram_user_id"]): item
+            for item in list(state_data.get("attendance_targets") or [])
+        }
+        activation_by_tg = {
+            str(item["work_tg"]).lstrip("@").casefold(): item
+            for item in list(state_data.get("activation_targets") or [])
+        }
+        issues = list(state_data.get("attendance_issues") or [])
+        recognized_names = list(state_data.get("attendance_names") or [])
+        recognized_keys = {"".join(str(item).split()).casefold() for item in recognized_names}
+        for name in names:
+            normalized_name = "".join(name.split()).casefold()
+            if normalized_name not in recognized_keys:
+                recognized_keys.add(normalized_name)
+                recognized_names.append(name)
         for result in sheet_results:
             name = str(result.get("chinese_name") or result.get("requested_name") or "")
             status = str(result.get("status") or "")
@@ -1011,15 +1028,20 @@ def build_dispatcher(services: Services) -> Dispatcher:
             work_tg = str(result.get("work_tg") or "")
             employee = employee_by_username.get(work_tg.lstrip("@").casefold())
             if employee:
-                attendance_targets.append({
+                attendance_by_id[employee.telegram_user_id] = {
                     "telegram_user_id": employee.telegram_user_id,
                     "chinese_name": name,
                     "work_tg": work_tg,
-                })
+                }
+                activation_by_tg.pop(work_tg.lstrip("@").casefold(), None)
             else:
-                activation_targets.append({"chinese_name": name, "work_tg": work_tg})
+                activation_by_tg[work_tg.lstrip("@").casefold()] = {
+                    "chinese_name": name, "work_tg": work_tg
+                }
 
-        state_data = await state.get_data()
+        attendance_targets = list(attendance_by_id.values())
+        activation_targets = list(activation_by_tg.values())
+        issues = list(dict.fromkeys(issues))
         attendance_template = await services.db.template(int(state_data.get("attendance_template_id") or 0))
         activation_template = await services.db.template(int(state_data.get("activation_template_id") or 0))
         if not attendance_template or not activation_template:
@@ -1029,10 +1051,12 @@ def build_dispatcher(services: Services) -> Dispatcher:
         await state.update_data(
             attendance_targets=attendance_targets,
             activation_targets=activation_targets,
+            attendance_issues=issues,
+            attendance_names=recognized_names,
         )
         lines = [
             "【考勤抽查发送预览】",
-            f"截图识别：{len(names)} 人",
+            f"本张识别：{len(names)} 人｜本批累计：{len(recognized_names)} 人",
             f"已登记，可发送考勤模板：{len(attendance_targets)} 人",
             f"未登记，需发送激活模板：{len(activation_targets)} 人",
             f"异常：{len(issues)} 人",
@@ -1058,9 +1082,12 @@ def build_dispatcher(services: Services) -> Dispatcher:
             await state.set_state(AttendanceCheck.waiting_for_screenshot)
             await message.answer("\n".join(lines)[:3900] + "\n\n没有可处理对象，请核对后重新发送截图。")
             return
-        await state.set_state(AttendanceCheck.waiting_for_confirmation)
+        # Keep the attendance session open so the next image is handled here instead
+        # of falling through to the onboarding screenshot handler. /cancel is the
+        # only operation that exits the session.
+        await state.set_state(AttendanceCheck.waiting_for_screenshot)
         await message.answer(
-            "\n".join(lines)[:3900],
+            "\n".join(lines)[:3700] + "\n\n可以继续发送下一张图片；名单会自动累计去重。",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="确认执行", callback_data="attendance:confirm"),
                 InlineKeyboardButton(text="取消", callback_data="attendance:cancel"),
@@ -1077,7 +1104,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
         if callback.message:
             await callback.message.edit_reply_markup(reply_markup=None)
 
-    @router.callback_query(AttendanceCheck.waiting_for_confirmation, F.data == "attendance:confirm")
+    @router.callback_query(AttendanceCheck.waiting_for_screenshot, F.data == "attendance:confirm")
     async def attendance_check_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         if not callback.from_user or not _is_admin(callback.from_user.id, services.settings):
             await callback.answer("无权操作", show_alert=True)
@@ -1091,7 +1118,18 @@ def build_dispatcher(services: Services) -> Dispatcher:
             await state.clear()
             await callback.answer("模板已经失效", show_alert=True)
             return
-        await state.clear()
+        if not targets and not activation_targets:
+            await callback.answer("当前批次已经处理或名单为空，请继续发送图片。", show_alert=True)
+            return
+        # Clear only the completed batch. Keep template ids and the attendance
+        # state so the administrator can immediately send more screenshots.
+        await state.set_state(AttendanceCheck.waiting_for_screenshot)
+        await state.update_data(
+            attendance_targets=[],
+            activation_targets=[],
+            attendance_issues=[],
+            attendance_names=[],
+        )
         await callback.answer("开始执行")
         if callback.message:
             await callback.message.edit_reply_markup(reply_markup=None)
@@ -1152,7 +1190,10 @@ def build_dispatcher(services: Services) -> Dispatcher:
                     f"\n⚠️ 以下员工从未激活机器人，机器人无法主动私聊。请人工转发：\n"
                     f"{activation_template[2]}\n\n{links}"
                 )
-            await callback.message.answer("\n".join(report)[:3900])
+            await callback.message.answer(
+                "\n".join(report)[:3700]
+                + "\n\n考勤抽查仍在等待下一张图片；发送 /cancel 才会退出。"
+            )
 
     @router.message(F.photo | (F.document & F.document.mime_type.startswith("image/")))
     async def profile_screenshot(message: Message, bot: Bot) -> None:
