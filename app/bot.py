@@ -6,7 +6,9 @@ import io
 import logging
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any, Awaitable, Callable
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram import BaseMiddleware
@@ -42,6 +44,7 @@ from app.vision_service import VisionService
 from app import hr_defaults
 
 logger = logging.getLogger(__name__)
+ATTENDANCE_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 class InboundAuditMiddleware(BaseMiddleware):
@@ -66,6 +69,17 @@ class InboundAuditMiddleware(BaseMiddleware):
             )
             if not _is_admin(user.id, self.services.settings):
                 bot: Bot = data["bot"]
+                now = datetime.now(UTC)
+                is_screenshot = content_type == "photo" or (
+                    content_type == "document"
+                    and bool(event.document and (event.document.mime_type or "").startswith("image/"))
+                )
+                attendance_status = await self.services.db.record_attendance_response(
+                    user.id,
+                    now.astimezone(ATTENDANCE_TIMEZONE).date().isoformat(),
+                    now,
+                    is_screenshot,
+                )
                 username = f"@{user.username}" if user.username else "无 username"
                 header = (
                     f"📨 员工新消息\n发送人：{user.full_name} · {username}\n"
@@ -77,6 +91,21 @@ class InboundAuditMiddleware(BaseMiddleware):
                         await bot.copy_message(admin_id, event.chat.id, event.message_id)
                     except Exception:
                         logger.exception("Failed to mirror inbound message to admin %s", admin_id)
+                if attendance_status == "screenshot_received":
+                    await bot.send_message(
+                        event.chat.id,
+                        "后台审核中.....如未接到人工联系说明审核通过",
+                    )
+                    return None
+                if attendance_status == "on_time":
+                    await bot.send_message(event.chat.id, "✅ 按时响应，感谢配合")
+                    return None
+                if attendance_status == "late_waiting_screenshot":
+                    await bot.send_message(
+                        event.chat.id,
+                        "⚠️超时回复，请发送接近抽查时间的带有时间戳的相关工作截图，后台会审核",
+                    )
+                    return None
         return await handler(event, data)
 
 
@@ -1146,11 +1175,37 @@ def build_dispatcher(services: Services) -> Dispatcher:
             try:
                 await bot.send_message(employee.chat_id, attendance_template[2])
                 successful.append(employee)
+                sent_at = datetime.now(UTC)
+                target = target_by_id[employee.telegram_user_id]
+                try:
+                    await services.db.create_attendance_check(
+                        employee.telegram_user_id,
+                        str(target["chinese_name"]),
+                        str(target["work_tg"]),
+                        sent_at.astimezone(ATTENDANCE_TIMEZONE).date().isoformat(),
+                        sent_at,
+                        sent_at + timedelta(minutes=20),
+                    )
+                except Exception:
+                    logger.exception("Failed to persist attendance check for user %s", employee.telegram_user_id)
             except TelegramRetryAfter as exc:
                 await asyncio.sleep(exc.retry_after + 0.5)
                 try:
                     await bot.send_message(employee.chat_id, attendance_template[2])
                     successful.append(employee)
+                    sent_at = datetime.now(UTC)
+                    target = target_by_id[employee.telegram_user_id]
+                    try:
+                        await services.db.create_attendance_check(
+                            employee.telegram_user_id,
+                            str(target["chinese_name"]),
+                            str(target["work_tg"]),
+                            sent_at.astimezone(ATTENDANCE_TIMEZONE).date().isoformat(),
+                            sent_at,
+                            sent_at + timedelta(minutes=20),
+                        )
+                    except Exception:
+                        logger.exception("Failed to persist attendance check for user %s", employee.telegram_user_id)
                 except Exception:
                     logger.exception("Attendance retry failed for user %s", employee.telegram_user_id)
                     failed.append(employee)
@@ -1420,3 +1475,39 @@ async def set_commands(bot: Bot, admin_user_ids: "frozenset[int] | None" = None)
             )
         except Exception:
             logger.exception("Failed to set admin command menu for %s", admin_id)
+
+
+async def attendance_reminder_loop(bot: Bot, services: Services) -> None:
+    """At/after 20:00 China time, notify admins once for today's unanswered checks."""
+    while True:
+        try:
+            now_local = datetime.now(ATTENDANCE_TIMEZONE)
+            cutoff_local = now_local.replace(hour=20, minute=0, second=0, microsecond=0)
+            if now_local >= cutoff_local:
+                unanswered = await services.db.unanswered_attendance(
+                    now_local.date().isoformat(), cutoff_local
+                )
+                if unanswered:
+                    lines = [
+                        f"{item['chinese_name']}-至今未回复考勤抽查"
+                        for item in unanswered
+                    ]
+                    text = "\n".join(lines)
+                    delivered = False
+                    for admin_id in services.settings.admin_user_ids:
+                        try:
+                            await bot.send_message(admin_id, text)
+                            delivered = True
+                        except Exception:
+                            logger.exception(
+                                "Failed to notify admin %s about unanswered attendance", admin_id
+                            )
+                    if delivered:
+                        await services.db.mark_attendance_notified(
+                            [int(item["id"]) for item in unanswered]
+                        )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Attendance reminder loop failed")
+        await asyncio.sleep(30)

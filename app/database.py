@@ -132,11 +132,27 @@ class Database:
                       private_contact TEXT,
                       work_email TEXT
                   );
-                  CREATE TABLE IF NOT EXISTS roster_sync_log (
+                CREATE TABLE IF NOT EXISTS roster_sync_log (
                       id INTEGER PRIMARY KEY AUTOINCREMENT,
                       synced_at TEXT NOT NULL,
                       row_count INTEGER NOT NULL
                   );
+                CREATE TABLE IF NOT EXISTS attendance_checks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_user_id INTEGER NOT NULL,
+                    chinese_name TEXT NOT NULL,
+                    work_tg TEXT NOT NULL,
+                    check_date TEXT NOT NULL,
+                    sent_at TEXT NOT NULL,
+                    deadline_at TEXT NOT NULL,
+                    replied_at TEXT,
+                    response_status TEXT NOT NULL DEFAULT 'pending',
+                    admin_notified INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_attendance_user_date
+                    ON attendance_checks (telegram_user_id, check_date, id);
+                CREATE INDEX IF NOT EXISTS idx_attendance_pending_date
+                    ON attendance_checks (check_date, response_status, admin_notified);
                 """
             )
             # 花名册填写规范更新：候选人编码不再是唯一识别符（改为按"姓名/简历名"匹配），
@@ -188,6 +204,112 @@ class Database:
                 await db.execute("ALTER TABLE feedback ADD COLUMN topic TEXT")
             await db.execute(
                 "UPDATE feedback SET topic = '历史问题' WHERE topic IS NULL OR TRIM(topic) = ''"
+            )
+            await db.commit()
+
+    async def create_attendance_check(
+        self,
+        telegram_user_id: int,
+        chinese_name: str,
+        work_tg: str,
+        check_date: str,
+        sent_at: datetime,
+        deadline_at: datetime,
+    ) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute(
+                """
+                UPDATE attendance_checks SET response_status = 'superseded'
+                WHERE telegram_user_id = ? AND check_date = ?
+                  AND response_status IN ('pending', 'late_waiting_screenshot')
+                """,
+                (telegram_user_id, check_date),
+            )
+            cursor = await db.execute(
+                """
+                INSERT INTO attendance_checks
+                    (telegram_user_id, chinese_name, work_tg, check_date,
+                     sent_at, deadline_at, response_status, admin_notified)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', 0)
+                """,
+                (
+                    telegram_user_id, chinese_name, work_tg, check_date,
+                    sent_at.astimezone(UTC).isoformat(),
+                    deadline_at.astimezone(UTC).isoformat(),
+                ),
+            )
+            await db.commit()
+            return int(cursor.lastrowid or 0)
+
+    async def record_attendance_response(
+        self,
+        telegram_user_id: int,
+        check_date: str,
+        replied_at: datetime,
+        is_screenshot: bool,
+    ) -> str | None:
+        """Atomically classify one response against the latest open check."""
+        now_utc = replied_at.astimezone(UTC)
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            row = await (await db.execute(
+                """
+                SELECT id, deadline_at, response_status
+                FROM attendance_checks
+                WHERE telegram_user_id = ? AND check_date = ?
+                  AND response_status IN ('pending', 'late_waiting_screenshot')
+                ORDER BY id DESC LIMIT 1
+                """,
+                (telegram_user_id, check_date),
+            )).fetchone()
+            if not row:
+                await db.commit()
+                return None
+            check_id, deadline_text, old_status = int(row[0]), str(row[1]), str(row[2])
+            if is_screenshot:
+                status = "screenshot_received"
+            elif old_status == "late_waiting_screenshot":
+                status = "late_waiting_screenshot"
+            else:
+                deadline = datetime.fromisoformat(deadline_text)
+                status = "on_time" if now_utc <= deadline else "late_waiting_screenshot"
+            await db.execute(
+                """
+                UPDATE attendance_checks
+                SET replied_at = ?, response_status = ?
+                WHERE id = ?
+                """,
+                (now_utc.isoformat(), status, check_id),
+            )
+            await db.commit()
+            return status
+
+    async def unanswered_attendance(
+        self, check_date: str, cutoff_at: datetime
+    ) -> list[dict[str, object]]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await (await db.execute(
+                """
+                SELECT id, telegram_user_id, chinese_name, work_tg, sent_at
+                FROM attendance_checks
+                WHERE check_date = ? AND response_status = 'pending'
+                  AND admin_notified = 0 AND sent_at <= ?
+                ORDER BY id
+                """,
+                (check_date, cutoff_at.astimezone(UTC).isoformat()),
+            )).fetchall()
+            return [dict(row) for row in rows]
+
+    async def mark_attendance_notified(self, check_ids: list[int]) -> None:
+        if not check_ids:
+            return
+        placeholders = ",".join("?" for _ in check_ids)
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                f"UPDATE attendance_checks SET admin_notified = 1 WHERE id IN ({placeholders})",
+                tuple(check_ids),
             )
             await db.commit()
 
