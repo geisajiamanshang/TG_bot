@@ -102,12 +102,16 @@ class GPTService:
                     + "gender只能是：男、女；"
                     + "age_range只能是：25以下、26-30、31-35、36-40、41-45、46-50、51以上（按年龄换算到对应区间）；"
                     + "education只能是：本科、博士、大专、高中及以下、硕士。"
+                    + "employee_code只能从标签‘员工编码’或‘员工编码（新）’提取，且必须正好6位；"
+                    + "绝对不要把‘候选人编码’当成employee_code。"
                     + "如果消息里提到了具体的部门/团队/编制/事业部等组织归属信息（哪怕只是随口一提，不是标准字段），"
                     + "原样摘录关键词到org_hint，不要编造，没提到就留空。"
                     + "如果消息里提到了试用期薪资或转正后薪资的具体数字，分别提取到trial_salary/confirmed_salary，"
                     + "只保留阿拉伯数字，把\"10k\"\"1万\"这类缩写换算成完整数字（10k→10000，1万→10000），不要加货币符号、单位或逗号，没提到就留空。"
                     + "如果消息里明确提到了直接上级/汇报对象是谁，原样摘录姓名到direct_supervisor，不要编造，没提到就留空。"
+                    + "如果消息里明确提到了间接上级，原样摘录姓名到indirect_supervisor；未提到就留空，后续由花名册同组织参考行补齐。"
                     + "如果消息里用“候选人姓名”来称呼候选人/新人姓名，与“姓名/简历名”是同一个字段，同样提取到resume_name，不要单独处理或留空。"
+                    + "严格禁止把候选人姓名或姓名/简历名写入chinese_name；chinese_name只能来自明确的‘中文花名’或‘花名’标签。"
                     + "\n\n消息内容：\n"
                     + message[:4000]
                 ),
@@ -119,12 +123,44 @@ class GPTService:
             if not match:
                 return {}
             payload = json.loads(match.group(0))
-            all_keys = list(PROFILE_FIELDS) + ["org_hint", "trial_salary", "confirmed_salary", "direct_supervisor"]
-            return {
+            all_keys = list(PROFILE_FIELDS) + [
+                "org_hint", "trial_salary", "confirmed_salary", "direct_supervisor", "indirect_supervisor",
+                "org_unit", "job_sequence", "service_entity", "department", "team",
+                "position_type", "position_title", "job_level", "job_grade",
+                "mgmt_sequence", "work_mode", "recruitment_channel", "resume_source",
+                "salary_currency",
+            ]
+            result = {
                 key: str(payload.get(key) or "").strip()
                 for key in all_keys
                 if str(payload.get(key) or "").strip()
             }
+            exact_code = re.search(
+                r"(?m)^\s*员工编码(?:（新）)?\s*[：:]\s*([^\s]+)", message
+            )
+            if not exact_code or len(exact_code.group(1).strip()) != 6:
+                result.pop("employee_code", None)
+            else:
+                result["employee_code"] = exact_code.group(1).strip()
+            if result.get("work_tg") and not result["work_tg"].startswith("@"):
+                result.pop("work_tg", None)
+            # Hard boundary for roster columns C/D. Do not trust model inference:
+            # C can only come from an explicit 花名 label, while candidate name
+            # and 姓名/简历名 always belong to D.
+            explicit_chinese_name = re.search(
+                r"(?m)^\s*(?:中文花名|花名)\s*[：:]\s*(.+?)\s*$", message
+            )
+            if explicit_chinese_name and explicit_chinese_name.group(1).strip():
+                result["chinese_name"] = explicit_chinese_name.group(1).strip()
+            else:
+                result.pop("chinese_name", None)
+            explicit_resume_name = re.search(
+                r"(?m)^\s*(?:候选人姓名|姓名/简历名|简历名)\s*[：:]\s*(.+?)\s*$",
+                message,
+            )
+            if explicit_resume_name and explicit_resume_name.group(1).strip():
+                result["resume_name"] = explicit_resume_name.group(1).strip()
+            return result
         except Exception:
             logger.exception("GPT profile text extraction failed")
             return {}

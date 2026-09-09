@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import logging
 import re
@@ -29,6 +30,8 @@ from app.database import Database, Employee
 from app.employee_profile import (
     DISPLAY_LABELS,
     clean_screenshot_values,
+    has_onboarding_keyword,
+    parse_extra_profile_fields,
     parse_profile_message,
     profile_text,
     validate_profile,
@@ -102,6 +105,12 @@ def _is_admin(user_id: int, settings: Settings) -> bool:
     return user_id in settings.admin_user_ids
 
 
+def _candidate_profile_id(candidate_name: str) -> int:
+    """Stable negative SQLite id for candidates submitted by an administrator."""
+    digest = hashlib.sha256(candidate_name.strip().casefold().encode("utf-8")).digest()
+    return -(int.from_bytes(digest[:8], "big") & ((1 << 62) - 1)) - 1
+
+
 def _is_wallet_completion(text: str) -> bool:
     normalized = re.sub(r"[\s_，,。.!！/\\-]+", "", text.casefold())
     has_wallet = "钱包" in normalized or "wallet" in normalized
@@ -127,10 +136,6 @@ def _apply_new_hire_defaults(
     new-hire submission. Only ever fills a gap or normalizes an already-given value -- never
     overrides anything explicitly present. Callers must only invoke this once the submission
     is confirmed to be a new hire (入职信息确认/新人入职), never for a plain 字段变更 update."""
-    if values.get("chinese_name") and not values.get("resume_name"):
-        values["resume_name"] = values["chinese_name"]
-    elif values.get("resume_name") and not values.get("chinese_name"):
-        values["chinese_name"] = values["resume_name"]
     values["nationality"] = hr_defaults.default_nationality(values.get("nationality", ""))
     values["office_region"] = hr_defaults.default_office_region(values.get("office_region", ""))
     values.setdefault("employment_status", "试用期")
@@ -280,7 +285,9 @@ async def _save_profile_values(
     # 只要候选人姓名和本地已有档案的姓名/简历名一致，就认定是同一个人，合并覆盖写入那条
     # 记录（保留其原有的 Telegram 归属信息，只更新字段），而不是新建一行；姓名对不上，就
     # 按新档案重新填写，不会误覆盖别人的记录。
-    candidate_name = str(values.get("chinese_name") or values.get("resume_name") or "").strip()
+    # Resume/candidate name is the stable identity used across 入职信息确认 and
+    # 新人入职; flower names may be assigned later and can be completely different.
+    candidate_name = str(values.get("resume_name") or values.get("chinese_name") or "").strip()
     if candidate_name:
         match = await services.db.profile_by_name(candidate_name)
         if match and int(match["telegram_user_id"]) != message.from_user.id:
@@ -288,6 +295,17 @@ async def _save_profile_values(
             target_user_id = int(match["telegram_user_id"])
             target_username = str(match.get("telegram_username") or "") or target_username
             target_full_name = str(match.get("telegram_full_name") or "") or target_full_name
+        elif (
+            not match
+            and is_new_hire_event
+            and _is_admin(message.from_user.id, services.settings)
+        ):
+            # One SSC administrator submits many different candidates. Do not merge
+            # all of them into the administrator's own single Telegram profile.
+            target_user_id = _candidate_profile_id(candidate_name)
+            target_username = None
+            target_full_name = candidate_name
+            existing = await services.db.profile(target_user_id)
     errors = validate_profile(values, is_new=existing is None and not allow_incomplete)
     if errors:
         await message.answer("信息暂未保存：\n- " + "\n- ".join(errors))
@@ -305,13 +323,41 @@ async def _save_profile_values(
         await message.answer(f"保存失败：{str(exc)[:120]}")
         return False
     if not changes:
-        await message.answer("收到，但档案内容没有变化。\n\n" + profile_text(saved))
-        return True
+        # A previous attempt may have saved locally but only partially reached Google
+        # Sheets. Reconcile every populated core field even when the local values did
+        # not change. Empty local fields never clear sheet data, and an empty changes
+        # dict means this repair does not create a change-record row.
+        if services.sheets.configured:
+            try:
+                row = await services.sheets.sync_profile(
+                    saved, {}, False, extra_fields, prefer_name_match,
+                    reconcile_core=True,
+                    onboarding_event=is_new_hire_event,
+                )
+                await services.db.set_profile_sync(target_user_id, "synced", row)
+                saved["sync_status"] = "synced"
+                saved["sheet_row"] = row
+                await message.answer(
+                    f"✅ 档案内容没有变化，已重新核对并同步到花名册第 {row} 行。\n\n"
+                    + profile_text(saved)
+                )
+            except Exception as exc:
+                logger.exception("Google Sheets reconciliation failed for %s", target_user_id)
+                await services.db.set_profile_sync(target_user_id, f"error: {str(exc)}")
+                await message.answer("云表重新核对失败，已保留记录供管理员处理。")
+            return True
+        if not services.sheets.configured:
+            await message.answer(
+                "档案内容没有变化，但仍在等待云表授权，暂时无法重试同步。\n\n"
+                + profile_text(saved)
+            )
+            return True
     sync_note = "已保存在机器人中，等待云表授权后自动同步。"
     if services.sheets.configured:
         try:
             row = await services.sheets.sync_profile(
-                saved, changes, is_new, extra_fields, prefer_name_match
+                saved, changes, is_new, extra_fields, prefer_name_match,
+                onboarding_event=is_new_hire_event,
             )
             await services.db.set_profile_sync(target_user_id, "synced", row)
             saved["sync_status"] = "synced"
@@ -900,39 +946,55 @@ def build_dispatcher(services: Services) -> Dispatcher:
         buffer = io.BytesIO()
         try:
             await bot.download(file_id, destination=buffer)
-            values = await services.vision.extract_employee_profile(buffer.getvalue(), mime_type or "image/jpeg")
+            values, image_keyword = await services.vision.extract_employee_profile(
+                buffer.getvalue(), mime_type or "image/jpeg"
+            )
         except Exception:
             logger.exception("Employee screenshot OCR failed for %s", message.from_user.id)
             await message.answer("截图识别失败，请发送更清晰的完整截图，或改为发送文字版表单。")
+            return
+        caption_keyword = has_onboarding_keyword(message.caption or "")
+        if not image_keyword and not caption_keyword:
+            await message.answer(
+                "这张图片中没有识别到“新人入职”或“入职信息确认”，因此没有写入花名册。"
+                "如需录入，请发送包含其中一个关键词的完整截图。"
+            )
             return
         if not values:
             await message.answer("没有从截图中识别到员工字段，请发送包含字段名称和填写内容的完整截图。")
             return
         org_hint = values.pop("org_hint", "")
-        trial_salary = values.pop("trial_salary", "")
-        confirmed_salary = values.pop("confirmed_salary", "")
-        direct_supervisor = values.pop("direct_supervisor", "")
+        extracted_extras = {
+            key: values.pop(key, "")
+            for key in (
+                "trial_salary", "confirmed_salary", "direct_supervisor",
+                "indirect_supervisor",
+                "org_unit", "job_sequence", "service_entity", "department",
+                "team", "position_type", "position_title", "job_level",
+                "job_grade", "mgmt_sequence", "work_mode",
+                "recruitment_channel", "resume_source", "salary_currency",
+            )
+        }
         values = clean_screenshot_values(values)
         if not values.get("employee_code") and not values.get("resume_name"):
             await message.answer("其他缺失字段可以留空，但必须能识别员工编码或候选人姓名/姓名/简历名，用于防止写错员工。请补充其中之一。")
             return
-        extra_fields: dict[str, str] = {}
-        if trial_salary:
-            extra_fields["trial_salary"] = trial_salary
-            extra_fields["salary_currency"] = "CNY"
-        if confirmed_salary:
-            extra_fields["confirmed_salary"] = confirmed_salary
-            extra_fields["salary_currency"] = "CNY"
-        if org_hint and services.sheets.configured:
+        extra_fields = {key: value for key, value in extracted_extras.items() if value}
+        if extra_fields.get("trial_salary") or extra_fields.get("confirmed_salary"):
+            extra_fields.setdefault("salary_currency", "CNY")
+        reference_hint = org_hint or " ".join(
+            str(extra_fields.get(key) or "") for key in ("org_unit", "department", "team")
+        ).strip()
+        if reference_hint and services.sheets.configured:
             try:
-                extra_fields.update(await services.sheets.find_reference_org_fields(org_hint))
+                reference_fields = await services.sheets.find_reference_org_fields(reference_hint)
+                for key, value in reference_fields.items():
+                    extra_fields.setdefault(key, value)
             except Exception:
                 logger.exception("Reference org lookup failed for %s", message.from_user.id)
-        if direct_supervisor:
-            extra_fields["direct_supervisor"] = direct_supervisor
         # 管理员发送的截图始终是"入职信息确认"场景，按新人入职套用花名册/变更记录填写规范的固定默认值。
         _apply_new_hire_defaults(values, extra_fields, org_hint)
-        raw = "[截图识别]\n" + "\n".join(
+        raw = f"[截图识别：{image_keyword or '图片说明触发'}]\n" + "\n".join(
             f"{DISPLAY_LABELS.get(key, key)}：{value}" for key, value in values.items()
         )
         # 管理员发送的"入职信息确认"截图始终按新人处理：先按候选人姓名（即姓名/简历名）匹配花名册
@@ -952,7 +1014,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
             return
         mode, values = parse_profile_message(message.text)
         if mode:
-            extra_fields: dict[str, str] = {}
+            extra_fields = parse_extra_profile_fields(message.text)
             org_hint = ""
             if services.settings.openai_api_key:
                 try:
@@ -961,25 +1023,37 @@ def build_dispatcher(services: Services) -> Dispatcher:
                     logger.exception("GPT profile text extraction failed for %s", message.from_user.id)
                     gpt_values = {}
                 org_hint = gpt_values.pop("org_hint", "")
-                trial_salary = gpt_values.pop("trial_salary", "")
-                confirmed_salary = gpt_values.pop("confirmed_salary", "")
-                direct_supervisor = gpt_values.pop("direct_supervisor", "")
+                extracted_extras = {
+                    key: gpt_values.pop(key, "")
+                    for key in (
+                        "trial_salary", "confirmed_salary", "direct_supervisor",
+                        "indirect_supervisor",
+                        "org_unit", "job_sequence", "service_entity", "department",
+                        "team", "position_type", "position_title", "job_level",
+                        "job_grade", "mgmt_sequence", "work_mode",
+                        "recruitment_channel", "resume_source", "salary_currency",
+                    )
+                }
                 gpt_values = clean_screenshot_values(gpt_values)
+                if gpt_values.get("work_tg") and not gpt_values["work_tg"].startswith("@"):
+                    gpt_values.pop("work_tg", None)
                 for key, value in gpt_values.items():
                     values.setdefault(key, value)
-                if trial_salary:
-                    extra_fields["trial_salary"] = trial_salary
-                    extra_fields["salary_currency"] = "CNY"
-                if confirmed_salary:
-                    extra_fields["confirmed_salary"] = confirmed_salary
-                    extra_fields["salary_currency"] = "CNY"
-                if org_hint and services.sheets.configured:
+                for key, value in extracted_extras.items():
+                    if value:
+                        extra_fields.setdefault(key, value)
+                if extra_fields.get("trial_salary") or extra_fields.get("confirmed_salary"):
+                    extra_fields.setdefault("salary_currency", "CNY")
+                reference_hint = org_hint or " ".join(
+                    str(extra_fields.get(key) or "") for key in ("org_unit", "department", "team")
+                ).strip()
+                if reference_hint and services.sheets.configured:
                     try:
-                        extra_fields.update(await services.sheets.find_reference_org_fields(org_hint))
+                        reference_fields = await services.sheets.find_reference_org_fields(reference_hint)
+                        for key, value in reference_fields.items():
+                            extra_fields.setdefault(key, value)
                     except Exception:
                         logger.exception("Reference org lookup failed for %s", message.from_user.id)
-                if direct_supervisor:
-                    extra_fields["direct_supervisor"] = direct_supervisor
             is_new_hire_event = mode == "new" or _is_new_hire_trigger(message.text)
             if is_new_hire_event:
                 _apply_new_hire_defaults(values, extra_fields, org_hint)
@@ -987,6 +1061,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
                 prefer_name_match = is_new_hire_event
                 await _save_profile_values(
                     message, services, values, message.text, require_existing=mode == "update",
+                    allow_incomplete=is_new_hire_event,
                     extra_fields=extra_fields, prefer_name_match=prefer_name_match,
                     is_new_hire_event=is_new_hire_event,
                 )

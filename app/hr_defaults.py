@@ -17,7 +17,7 @@ from datetime import date, timedelta
 # below don't overlap in practice.
 HRBP_MAPPING: list[tuple[tuple[str, ...], str]] = [
     (("运营一部", "商务部", "渠道部"), "冯晚柠 @FWN066"),
-    (("运营二部", "ACFan产品组", "品牌组"), "段奕宏 @wean4790"),
+    (("运营二部", "ACFan产品组", "ACFAN特战队", "app运营组", "品牌组"), "段奕宏 @wean4790"),
     (("技术部",), "星榆 @feang99568"),
     (("效能部", "内容组", "SEO组"), "林尔康 @linerkang"),
 ]

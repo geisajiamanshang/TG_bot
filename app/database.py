@@ -6,6 +6,8 @@ from pathlib import Path
 
 import aiosqlite
 
+from app.employee_profile import person_name_keys
+
 
 @dataclass(frozen=True)
 class Employee:
@@ -259,18 +261,35 @@ class Database:
         Matches an existing (non-deleted) profile whose stored chinese_name or
         resume_name equals the given candidate name (trimmed, case-insensitive).
         Returns the most recently updated match if more than one row somehow ties."""
-        normalized = name.strip()
-        if not normalized:
+        lookup_keys = person_name_keys(name)
+        if not lookup_keys:
             return None
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
-            row = await (await db.execute(
-                "SELECT * FROM employee_profiles WHERE deleted = 0 AND "
-                "(LOWER(TRIM(chinese_name)) = LOWER(TRIM(?)) OR LOWER(TRIM(resume_name)) = LOWER(TRIM(?))) "
-                "ORDER BY updated_at DESC LIMIT 1",
-                (normalized, normalized),
-            )).fetchone()
-            return dict(row) if row else None
+            rows = await (await db.execute(
+                "SELECT * FROM employee_profiles WHERE deleted = 0"
+            )).fetchall()
+        matches = [
+            dict(row) for row in rows
+            if lookup_keys & (
+                person_name_keys(str(row["resume_name"] or ""))
+                | person_name_keys(str(row["chinese_name"] or ""))
+            )
+        ]
+        if not matches:
+            return None
+        # Prefer a real Telegram-owned profile carrying a real employee code;
+        # synthetic SSC placeholders remain a fallback only.
+        matches.sort(
+            key=lambda item: (
+                bool(str(item.get("employee_code") or "")),
+                int(item.get("telegram_user_id") or 0) > 0,
+                bool(item.get("sheet_row")),
+                str(item.get("updated_at") or ""),
+            ),
+            reverse=True,
+        )
+        return matches[0]
 
     async def save_profile(
         self,
