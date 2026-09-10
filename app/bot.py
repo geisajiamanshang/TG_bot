@@ -149,6 +149,10 @@ class AttendanceCheck(StatesGroup):
     waiting_for_screenshot = State()
 
 
+class ChannelMessageSend(StatesGroup):
+    waiting_for_confirmation = State()
+
+
 class TemplateCreate(StatesGroup):
     waiting_for_name = State()
     waiting_for_content = State()
@@ -585,7 +589,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
             await message.answer(text[start:start + 3800])
 
     @router.message(Command("send_channel_msg"))
-    async def send_channel_message_check(message: Message) -> None:
+    async def send_channel_message_check(message: Message, state: FSMContext) -> None:
         if not message.from_user or not _is_admin(message.from_user.id, services.settings):
             await message.answer("无权使用此命令。")
             return
@@ -606,40 +610,163 @@ def build_dispatcher(services: Services) -> Dispatcher:
             if employee.username and employee.username.strip().lstrip("@")
         }
         sent_ids = await services.db.channel_message_recipient_ids()
-        missing: dict[str, dict[str, str]] = {}
+        activation_needed: dict[str, dict[str, str]] = {}
+        channel_needed: dict[int, dict[str, object]] = {}
         for item in candidates:
             username = item["work_tg"].lstrip("@").casefold()
             employee = employee_by_username.get(username) if username else None
-            reasons: list[str] = []
             if not username:
-                reasons.append("AD列工作TG为空，未激活")
+                key = item["chinese_name"].strip().casefold()
+                activation_needed[key] = {**item, "reason": "AD列工作TG为空，未激活"}
             elif not employee:
-                reasons.append("工作TG未激活机器人")
+                activation_needed[username] = {**item, "reason": "工作TG未激活机器人"}
             elif employee.telegram_user_id not in sent_ids:
-                reasons.append("无“关注恒睿频道”个人发送记录")
-            if not reasons:
-                continue
-            key = username or item["chinese_name"].strip().casefold()
-            missing[key] = {**item, "reason": "；".join(reasons)}
-        if not missing:
+                channel_needed[employee.telegram_user_id] = {
+                    **item,
+                    "telegram_user_id": employee.telegram_user_id,
+                    "chat_id": employee.chat_id,
+                }
+        if not activation_needed and not channel_needed:
             await message.answer(
                 "✅ 检查完成：AQ列入职日期从2026-08-01起的员工，均已激活并有“关注恒睿频道”发送记录。"
             )
             return
-        items = list(missing.values())
+        activation_template = await services.db.template_by_name("激活机器人")
+        channel_template = await services.db.template_by_name("关注恒睿频道")
+        if not activation_template or not channel_template:
+            await message.answer("缺少启用中的“激活机器人”或“关注恒睿频道”模板。")
+            return
+        await state.clear()
         lines = [
-            "【关注恒睿频道待处理名单】",
+            "【频道消息待处理名单】",
             "范围：花名册 AQ 入职日期 ≥ 2026-08-01",
-            f"共 {len(items)} 人",
+            f"未激活：{len(activation_needed)} 人",
+            f"已激活但未发频道消息：{len(channel_needed)} 人",
         ]
-        for index, item in enumerate(items, 1):
-            lines.append(
-                f"{index}. {item['chinese_name']}｜{item['work_tg'] or '无工作TG'}｜"
-                f"{item['hire_date']}｜{item['reason']}"
-            )
+        if activation_needed:
+            lines.append("\n【未激活机器人｜请管理员人工发送】")
+            for index, item in enumerate(activation_needed.values(), 1):
+                username = str(item["work_tg"] or "").lstrip("@")
+                contact = f"https://t.me/{username}" if username else "AD列无工作TG，需人工补充"
+                lines.append(
+                    f"{index}. {item['chinese_name']}｜{item['work_tg'] or '无工作TG'}｜"
+                    f"{item['hire_date']}｜{contact}"
+                )
+            lines.append(f"\n激活机器人模板：\n{activation_template[2]}")
+        if channel_needed:
+            lines.append("\n【可由机器人直接发送频道消息】")
+            for index, item in enumerate(channel_needed.values(), 1):
+                lines.append(
+                    f"{index}. {item['chinese_name']}｜{item['work_tg']}｜{item['hire_date']}"
+                )
+            lines.append(f"\n关注恒睿频道模板：\n{channel_template[2]}")
         text = "\n".join(lines)
-        for start in range(0, len(text), 3800):
-            await message.answer(text[start:start + 3800])
+        for start in range(0, len(text), 3700):
+            await message.answer(text[start:start + 3700])
+        if channel_needed:
+            await state.set_state(ChannelMessageSend.waiting_for_confirmation)
+            await state.update_data(
+                channel_send_ids=list(channel_needed),
+                channel_template_id=channel_template[0],
+                channel_target_names={
+                    str(user_id): str(item["chinese_name"])
+                    for user_id, item in channel_needed.items()
+                },
+            )
+            await message.answer(
+                f"确认向以上 {len(channel_needed)} 名已激活员工发送“关注恒睿频道”模板吗？",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="确认直接发送", callback_data="channelmsg:confirm"),
+                    InlineKeyboardButton(text="取消", callback_data="channelmsg:cancel"),
+                ]]),
+            )
+
+    @router.callback_query(F.data == "channelmsg:cancel")
+    async def channel_message_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+        if not callback.from_user or not _is_admin(callback.from_user.id, services.settings):
+            await callback.answer("无权操作", show_alert=True)
+            return
+        await state.clear()
+        await callback.answer("已取消")
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
+
+    @router.callback_query(ChannelMessageSend.waiting_for_confirmation, F.data == "channelmsg:confirm")
+    async def channel_message_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+        if not callback.from_user or not _is_admin(callback.from_user.id, services.settings):
+            await callback.answer("无权操作", show_alert=True)
+            return
+        data = await state.get_data()
+        user_ids = [int(value) for value in data.get("channel_send_ids", [])]
+        target_names = dict(data.get("channel_target_names") or {})
+        template = await services.db.template(int(data.get("channel_template_id") or 0))
+        recipients = await services.db.active_employees_by_ids(user_ids)
+        if not template or not recipients:
+            await state.clear()
+            await callback.answer("模板或联系人已失效", show_alert=True)
+            return
+        await state.clear()
+        await callback.answer("开始发送")
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.message.answer("已确认，正在发送“关注恒睿频道”消息……")
+        successful: list[Employee] = []
+        failed: list[Employee] = []
+        delay = 1 / services.settings.broadcast_messages_per_second
+        for employee in recipients:
+            try:
+                await bot.send_message(employee.chat_id, template[2])
+                successful.append(employee)
+                try:
+                    await services.db.save_outbound_message(
+                        employee.telegram_user_id, employee.chat_id, template[2],
+                        message_kind="channel_message", template_name=template[1],
+                    )
+                except Exception:
+                    logger.exception("Failed to log channel message for user %s", employee.telegram_user_id)
+            except TelegramRetryAfter as exc:
+                await asyncio.sleep(exc.retry_after + 0.5)
+                try:
+                    await bot.send_message(employee.chat_id, template[2])
+                    successful.append(employee)
+                    try:
+                        await services.db.save_outbound_message(
+                            employee.telegram_user_id, employee.chat_id, template[2],
+                            message_kind="channel_message", template_name=template[1],
+                        )
+                    except Exception:
+                        logger.exception("Failed to log channel message for user %s", employee.telegram_user_id)
+                except Exception:
+                    logger.exception("Channel-message retry failed for user %s", employee.telegram_user_id)
+                    failed.append(employee)
+            except (TelegramForbiddenError, TelegramBadRequest):
+                await services.db.deactivate_employee(employee.telegram_user_id)
+                failed.append(employee)
+            except Exception:
+                logger.exception("Channel-message send failed for user %s", employee.telegram_user_id)
+                failed.append(employee)
+            await asyncio.sleep(delay)
+        await services.db.save_broadcast(
+            callback.from_user.id, f"[关注恒睿频道]\n{template[2]}",
+            len(successful), len(failed),
+        )
+        if callback.message:
+            lines = [
+                "“关注恒睿频道”发送完成。",
+                f"成功：{len(successful)}",
+                f"失败：{len(failed)}",
+            ]
+            if successful:
+                lines.append("\n✅ 成功名单：\n" + "\n".join(
+                    f"{target_names.get(str(item.telegram_user_id), item.full_name)} · "
+                    f"@{item.username}" for item in successful
+                ))
+            if failed:
+                lines.append("\n❌ 失败名单：\n" + "\n".join(
+                    f"{target_names.get(str(item.telegram_user_id), item.full_name)} · "
+                    f"@{item.username or '无username'}" for item in failed
+                ))
+            await callback.message.answer("\n".join(lines)[:3900])
 
     @router.message(Command("profile"))
     async def my_profile(message: Message) -> None:
