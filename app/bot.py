@@ -6,7 +6,7 @@ import io
 import logging
 import re
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
@@ -597,8 +597,9 @@ def build_dispatcher(services: Services) -> Dispatcher:
             await message.answer("Google 花名册尚未配置，无法检查。")
             return
         await message.answer("正在只读检查花名册 AD、AQ 列和机器人个人发送记录……")
+        month_start = datetime.now(ATTENDANCE_TIMEZONE).date().replace(day=1)
         try:
-            candidates = await services.sheets.channel_message_candidates(date(2026, 8, 1))
+            candidates = await services.sheets.channel_message_candidates(month_start)
         except Exception as exc:
             logger.exception("Channel-message candidate lookup failed")
             await message.answer(f"花名册读取失败：{str(exc)[:160]}")
@@ -628,7 +629,8 @@ def build_dispatcher(services: Services) -> Dispatcher:
                 }
         if not activation_needed and not channel_needed:
             await message.answer(
-                "✅ 检查完成：AQ列入职日期从2026-08-01起的员工，均已激活并有“关注恒睿频道”发送记录。"
+                f"✅ 检查完成：AQ列入职日期从{month_start.isoformat()}起的员工，"
+                "均已激活并有“关注恒睿频道”发送记录。"
             )
             return
         activation_template = await services.db.template_by_name("激活机器人")
@@ -639,7 +641,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
         await state.clear()
         lines = [
             "【频道消息待处理名单】",
-            "范围：花名册 AQ 入职日期 ≥ 2026-08-01",
+            f"范围：花名册 AQ 入职日期 ≥ {month_start.isoformat()}（当月第一天）",
             f"未激活：{len(activation_needed)} 人",
             f"已激活但未发频道消息：{len(channel_needed)} 人",
         ]
