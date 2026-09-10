@@ -150,6 +150,17 @@ class Database:
                     admin_notified INTEGER NOT NULL DEFAULT 0,
                     absence_notified INTEGER NOT NULL DEFAULT 0
                 );
+                CREATE TABLE IF NOT EXISTS outbound_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_user_id INTEGER NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    message_kind TEXT NOT NULL,
+                    template_name TEXT,
+                    content TEXT NOT NULL,
+                    sent_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_outbound_user_template
+                    ON outbound_messages (telegram_user_id, template_name, sent_at);
                 CREATE INDEX IF NOT EXISTS idx_attendance_user_date
                     ON attendance_checks (telegram_user_id, check_date, id);
                 CREATE INDEX IF NOT EXISTS idx_attendance_pending_date
@@ -217,6 +228,42 @@ class Database:
                 "UPDATE feedback SET topic = '历史问题' WHERE topic IS NULL OR TRIM(topic) = ''"
             )
             await db.commit()
+
+    async def save_outbound_message(
+        self,
+        telegram_user_id: int,
+        chat_id: int,
+        content: str,
+        message_kind: str = "bot",
+        template_name: str | None = None,
+    ) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO outbound_messages
+                    (telegram_user_id, chat_id, message_kind, template_name, content, sent_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    telegram_user_id, chat_id, message_kind, template_name,
+                    content, datetime.now(UTC).isoformat(),
+                ),
+            )
+            await db.commit()
+            return int(cursor.lastrowid or 0)
+
+    async def channel_message_recipient_ids(self) -> set[int]:
+        async with aiosqlite.connect(self.path) as db:
+            rows = await (await db.execute(
+                """
+                SELECT DISTINCT telegram_user_id
+                FROM outbound_messages
+                WHERE template_name = '关注恒睿频道'
+                   OR content LIKE '%关注恒睿频道%'
+                   OR content LIKE '%lmN_ogF61KRlM2U0%'
+                """
+            )).fetchall()
+            return {int(row[0]) for row in rows}
 
     async def create_attendance_check(
         self,

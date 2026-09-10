@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from collections import Counter
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from threading import Lock
 
@@ -243,6 +243,42 @@ class GoogleSheetsService:
                 "work_tg": f"@{username}",
                 "row": str(matching[0]),
                 "status": "matched",
+            })
+        return results
+
+    async def channel_message_candidates(
+        self, since_date: date
+    ) -> list[dict[str, str]]:
+        """Read-only C/AD/AQ lookup for employees hired on or after since_date."""
+        return await asyncio.to_thread(self._channel_message_candidates, since_date)
+
+    def _channel_message_candidates(self, since_date: date) -> list[dict[str, str]]:
+        service = self._service()
+        rows = self._read_rows(service, ROSTER_SHEET, "C4:AQ5000")
+        results: list[dict[str, str]] = []
+        for row_number, row in enumerate(rows, start=ROSTER_START_ROW):
+            chinese_name = str(row[0] if row else "").strip()
+            work_tg = str(row[27] if len(row) > 27 else "").strip()
+            hire_date_text = str(row[40] if len(row) > 40 else "").strip()
+            if not chinese_name or not hire_date_text:
+                continue
+            normalized_date = hire_date_text.replace("/", "-").replace(".", "-")
+            try:
+                hire_date = date.fromisoformat(normalized_date)
+            except ValueError:
+                logger.warning(
+                    "Skipped unparseable AQ hire date at roster row %s: %r",
+                    row_number, hire_date_text,
+                )
+                continue
+            if hire_date < since_date:
+                continue
+            username = work_tg.lstrip("@").strip()
+            results.append({
+                "row": str(row_number),
+                "chinese_name": chinese_name,
+                "work_tg": f"@{username}" if username else "",
+                "hire_date": hire_date.isoformat(),
             })
         return results
 

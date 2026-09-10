@@ -6,7 +6,7 @@ import io
 import logging
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
@@ -471,6 +471,13 @@ def build_dispatcher(services: Services) -> Dispatcher:
             for _, template_name, content, _ in await services.db.templates(auto_only=True):
                 try:
                     await message.answer(f"【{template_name}】\n\n{content}")
+                    await services.db.save_outbound_message(
+                        message.from_user.id,
+                        message.chat.id,
+                        content,
+                        message_kind="auto_template",
+                        template_name=template_name,
+                    )
                 except Exception:
                     logger.exception(
                         "Failed to send newcomer template to user %s", message.from_user.id
@@ -573,6 +580,63 @@ def build_dispatcher(services: Services) -> Dispatcher:
             resume_name = item.get("resume_name") or ""
             work_tg = item.get("work_tg") or "无TG"
             lines.append(f"{code}｜{chinese_name} · {resume_name} · {work_tg}")
+        text = "\n".join(lines)
+        for start in range(0, len(text), 3800):
+            await message.answer(text[start:start + 3800])
+
+    @router.message(Command("send_channel_msg"))
+    async def send_channel_message_check(message: Message) -> None:
+        if not message.from_user or not _is_admin(message.from_user.id, services.settings):
+            await message.answer("无权使用此命令。")
+            return
+        if not services.sheets.configured:
+            await message.answer("Google 花名册尚未配置，无法检查。")
+            return
+        await message.answer("正在只读检查花名册 AD、AQ 列和机器人个人发送记录……")
+        try:
+            candidates = await services.sheets.channel_message_candidates(date(2026, 8, 1))
+        except Exception as exc:
+            logger.exception("Channel-message candidate lookup failed")
+            await message.answer(f"花名册读取失败：{str(exc)[:160]}")
+            return
+        employees = await services.db.active_employees()
+        employee_by_username = {
+            employee.username.strip().lstrip("@").casefold(): employee
+            for employee in employees
+            if employee.username and employee.username.strip().lstrip("@")
+        }
+        sent_ids = await services.db.channel_message_recipient_ids()
+        missing: dict[str, dict[str, str]] = {}
+        for item in candidates:
+            username = item["work_tg"].lstrip("@").casefold()
+            employee = employee_by_username.get(username) if username else None
+            reasons: list[str] = []
+            if not username:
+                reasons.append("AD列工作TG为空，未激活")
+            elif not employee:
+                reasons.append("工作TG未激活机器人")
+            elif employee.telegram_user_id not in sent_ids:
+                reasons.append("无“关注恒睿频道”个人发送记录")
+            if not reasons:
+                continue
+            key = username or item["chinese_name"].strip().casefold()
+            missing[key] = {**item, "reason": "；".join(reasons)}
+        if not missing:
+            await message.answer(
+                "✅ 检查完成：AQ列入职日期从2026-08-01起的员工，均已激活并有“关注恒睿频道”发送记录。"
+            )
+            return
+        items = list(missing.values())
+        lines = [
+            "【关注恒睿频道待处理名单】",
+            "范围：花名册 AQ 入职日期 ≥ 2026-08-01",
+            f"共 {len(items)} 人",
+        ]
+        for index, item in enumerate(items, 1):
+            lines.append(
+                f"{index}. {item['chinese_name']}｜{item['work_tg'] or '无工作TG'}｜"
+                f"{item['hire_date']}｜{item['reason']}"
+            )
         text = "\n".join(lines)
         for start in range(0, len(text), 3800):
             await message.answer(text[start:start + 3800])
@@ -950,6 +1014,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
             return
         data = await state.get_data()
         content = str(data.get("content", "")).strip()
+        template_name = str(data.get("template_name", "")).strip() or None
         selected_ids = [int(value) for value in data.get("selected_ids", [])]
         recipients = await services.db.active_employees_by_ids(selected_ids)
         if not content or not recipients:
@@ -970,11 +1035,25 @@ def build_dispatcher(services: Services) -> Dispatcher:
             try:
                 await bot.send_message(employee.chat_id, content)
                 successful.append(employee)
+                try:
+                    await services.db.save_outbound_message(
+                        employee.telegram_user_id, employee.chat_id, content,
+                        message_kind="broadcast", template_name=template_name,
+                    )
+                except Exception:
+                    logger.exception("Failed to log outbound message for user %s", employee.telegram_user_id)
             except TelegramRetryAfter as exc:
                 await asyncio.sleep(exc.retry_after + 0.5)
                 try:
                     await bot.send_message(employee.chat_id, content)
                     successful.append(employee)
+                    try:
+                        await services.db.save_outbound_message(
+                            employee.telegram_user_id, employee.chat_id, content,
+                            message_kind="broadcast", template_name=template_name,
+                        )
+                    except Exception:
+                        logger.exception("Failed to log outbound message for user %s", employee.telegram_user_id)
                 except Exception:
                     logger.exception(
                         "Broadcast retry failed for user %s", employee.telegram_user_id
@@ -1490,6 +1569,7 @@ ADMIN_COMMANDS = [
     BotCommand(command="inbox", description="管理员查看员工消息"),
     BotCommand(command="sync", description="管理员同步花名册(只读)"),
     BotCommand(command="roster", description="管理员查看本地花名册"),
+    BotCommand(command="send_channel_msg", description="检查频道消息待处理名单"),
 ]
 
 
