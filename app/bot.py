@@ -674,6 +674,10 @@ def build_dispatcher(services: Services) -> Dispatcher:
                     str(user_id): str(item["chinese_name"])
                     for user_id, item in channel_needed.items()
                 },
+                channel_target_work_tg={
+                    str(user_id): str(item["work_tg"])
+                    for user_id, item in channel_needed.items()
+                },
             )
             await message.answer(
                 f"确认向以上 {len(channel_needed)} 名已激活员工发送“关注恒睿频道”模板吗？",
@@ -701,6 +705,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
         data = await state.get_data()
         user_ids = [int(value) for value in data.get("channel_send_ids", [])]
         target_names = dict(data.get("channel_target_names") or {})
+        target_work_tg = dict(data.get("channel_target_work_tg") or {})
         template = await services.db.template(int(data.get("channel_template_id") or 0))
         recipients = await services.db.active_employees_by_ids(user_ids)
         if not template or not recipients:
@@ -761,12 +766,14 @@ def build_dispatcher(services: Services) -> Dispatcher:
             if successful:
                 lines.append("\n✅ 成功名单：\n" + "\n".join(
                     f"{target_names.get(str(item.telegram_user_id), item.full_name)} · "
-                    f"@{item.username}" for item in successful
+                    f"{target_work_tg.get(str(item.telegram_user_id), 'AD列无工作TG')}"
+                    for item in successful
                 ))
             if failed:
                 lines.append("\n❌ 失败名单：\n" + "\n".join(
                     f"{target_names.get(str(item.telegram_user_id), item.full_name)} · "
-                    f"@{item.username or '无username'}" for item in failed
+                    f"{target_work_tg.get(str(item.telegram_user_id), 'AD列无工作TG')}"
+                    for item in failed
                 ))
             await callback.message.answer("\n".join(lines)[:3900])
 
