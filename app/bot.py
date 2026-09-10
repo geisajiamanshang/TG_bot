@@ -67,6 +67,23 @@ class InboundAuditMiddleware(BaseMiddleware):
                 user.id, event.chat.id, event.message_id, user.username,
                 user.full_name, content_type, content,
             )
+            if _is_admin(user.id, self.services.settings):
+                state: FSMContext | None = data.get("state")
+                current_state = await state.get_state() if state else None
+                is_image = content_type == "photo" or (
+                    content_type == "document"
+                    and bool(event.document and (event.document.mime_type or "").startswith("image/"))
+                )
+                is_cancel = bool(event.text and event.text.strip().casefold().startswith("/cancel"))
+                if (
+                    current_state == AttendanceCheck.waiting_for_screenshot.state
+                    and not is_image and not is_cancel
+                ):
+                    await data["bot"].send_message(
+                        event.chat.id,
+                        "考勤抽查模式仍在运行，请继续发送截图；只有 /cancel 才会退出。",
+                    )
+                    return None
             if not _is_admin(user.id, self.services.settings):
                 bot: Bot = data["bot"]
                 now = datetime.now(UTC)
@@ -74,12 +91,13 @@ class InboundAuditMiddleware(BaseMiddleware):
                     content_type == "document"
                     and bool(event.document and (event.document.mime_type or "").startswith("image/"))
                 )
-                attendance_status = await self.services.db.record_attendance_response(
+                attendance_result = await self.services.db.record_attendance_response(
                     user.id,
                     now.astimezone(ATTENDANCE_TIMEZONE).date().isoformat(),
                     now,
                     is_screenshot,
                 )
+                attendance_status = str(attendance_result.get("status") or "") if attendance_result else ""
                 username = f"@{user.username}" if user.username else "无 username"
                 header = (
                     f"📨 员工新消息\n发送人：{user.full_name} · {username}\n"
@@ -91,6 +109,18 @@ class InboundAuditMiddleware(BaseMiddleware):
                         await bot.copy_message(admin_id, event.chat.id, event.message_id)
                     except Exception:
                         logger.exception("Failed to mirror inbound message to admin %s", admin_id)
+                if attendance_result and attendance_result.get("notify_late"):
+                    elapsed_seconds = int(attendance_result.get("elapsed_seconds") or 0)
+                    elapsed_minutes, seconds = divmod(elapsed_seconds, 60)
+                    late_notice = (
+                        f"{attendance_result['chinese_name']}-考勤消息慢回（超过20分钟），"
+                        f"扣10 USD/次\n回复用时：{elapsed_minutes}分{seconds}秒"
+                    )
+                    for admin_id in self.services.settings.admin_user_ids:
+                        try:
+                            await bot.send_message(admin_id, late_notice)
+                        except Exception:
+                            logger.exception("Failed to notify admin %s about late reply", admin_id)
                 if attendance_status == "screenshot_received":
                     await bot.send_message(
                         event.chat.id,
@@ -1482,6 +1512,25 @@ async def attendance_reminder_loop(bot: Bot, services: Services) -> None:
     while True:
         try:
             now_local = datetime.now(ATTENDANCE_TIMEZONE)
+            absences = await services.db.attendance_absences_due(now_local)
+            if absences:
+                absence_text = "\n".join(
+                    f"{item['chinese_name']}-工作时段失联满30分钟，按旷工0.5天计"
+                    for item in absences
+                )
+                absence_delivered = False
+                for admin_id in services.settings.admin_user_ids:
+                    try:
+                        await bot.send_message(admin_id, absence_text)
+                        absence_delivered = True
+                    except Exception:
+                        logger.exception(
+                            "Failed to notify admin %s about attendance absence", admin_id
+                        )
+                if absence_delivered:
+                    await services.db.mark_attendance_absence_notified(
+                        [int(item["id"]) for item in absences]
+                    )
             cutoff_local = now_local.replace(hour=20, minute=0, second=0, microsecond=0)
             if now_local >= cutoff_local:
                 unanswered = await services.db.unanswered_attendance(

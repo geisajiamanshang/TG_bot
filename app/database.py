@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
@@ -147,7 +147,8 @@ class Database:
                     deadline_at TEXT NOT NULL,
                     replied_at TEXT,
                     response_status TEXT NOT NULL DEFAULT 'pending',
-                    admin_notified INTEGER NOT NULL DEFAULT 0
+                    admin_notified INTEGER NOT NULL DEFAULT 0,
+                    absence_notified INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS idx_attendance_user_date
                     ON attendance_checks (telegram_user_id, check_date, id);
@@ -202,6 +203,16 @@ class Database:
             }
             if "topic" not in columns:
                 await db.execute("ALTER TABLE feedback ADD COLUMN topic TEXT")
+            attendance_columns = {
+                str(row[1])
+                for row in await (await db.execute(
+                    "PRAGMA table_info(attendance_checks)"
+                )).fetchall()
+            }
+            if "absence_notified" not in attendance_columns:
+                await db.execute(
+                    "ALTER TABLE attendance_checks ADD COLUMN absence_notified INTEGER NOT NULL DEFAULT 0"
+                )
             await db.execute(
                 "UPDATE feedback SET topic = '历史问题' WHERE topic IS NULL OR TRIM(topic) = ''"
             )
@@ -248,14 +259,14 @@ class Database:
         check_date: str,
         replied_at: datetime,
         is_screenshot: bool,
-    ) -> str | None:
+    ) -> dict[str, object] | None:
         """Atomically classify one response against the latest open check."""
         now_utc = replied_at.astimezone(UTC)
         async with aiosqlite.connect(self.path) as db:
             await db.execute("BEGIN IMMEDIATE")
             row = await (await db.execute(
                 """
-                SELECT id, deadline_at, response_status
+                SELECT id, chinese_name, work_tg, sent_at, deadline_at, response_status
                 FROM attendance_checks
                 WHERE telegram_user_id = ? AND check_date = ?
                   AND response_status IN ('pending', 'late_waiting_screenshot')
@@ -266,13 +277,17 @@ class Database:
             if not row:
                 await db.commit()
                 return None
-            check_id, deadline_text, old_status = int(row[0]), str(row[1]), str(row[2])
+            check_id = int(row[0])
+            chinese_name, work_tg = str(row[1]), str(row[2])
+            sent_at = datetime.fromisoformat(str(row[3]))
+            deadline_text, old_status = str(row[4]), str(row[5])
+            deadline = datetime.fromisoformat(deadline_text)
+            is_late = now_utc > deadline
             if is_screenshot:
                 status = "screenshot_received"
             elif old_status == "late_waiting_screenshot":
                 status = "late_waiting_screenshot"
             else:
-                deadline = datetime.fromisoformat(deadline_text)
                 status = "on_time" if now_utc <= deadline else "late_waiting_screenshot"
             await db.execute(
                 """
@@ -283,7 +298,43 @@ class Database:
                 (now_utc.isoformat(), status, check_id),
             )
             await db.commit()
-            return status
+            return {
+                "id": check_id,
+                "status": status,
+                "chinese_name": chinese_name,
+                "work_tg": work_tg,
+                "sent_at": sent_at.isoformat(),
+                "replied_at": now_utc.isoformat(),
+                "elapsed_seconds": max(0, int((now_utc - sent_at).total_seconds())),
+                "notify_late": is_late and old_status == "pending",
+            }
+
+    async def attendance_absences_due(self, now: datetime) -> list[dict[str, object]]:
+        cutoff = now.astimezone(UTC) - timedelta(minutes=30)
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await (await db.execute(
+                """
+                SELECT id, telegram_user_id, chinese_name, work_tg, sent_at
+                FROM attendance_checks
+                WHERE response_status = 'pending' AND absence_notified = 0
+                  AND sent_at <= ?
+                ORDER BY id
+                """,
+                (cutoff.isoformat(),),
+            )).fetchall()
+            return [dict(row) for row in rows]
+
+    async def mark_attendance_absence_notified(self, check_ids: list[int]) -> None:
+        if not check_ids:
+            return
+        placeholders = ",".join("?" for _ in check_ids)
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                f"UPDATE attendance_checks SET absence_notified = 1 WHERE id IN ({placeholders})",
+                tuple(check_ids),
+            )
+            await db.commit()
 
     async def unanswered_attendance(
         self, check_date: str, cutoff_at: datetime
