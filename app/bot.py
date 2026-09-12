@@ -193,7 +193,7 @@ def _is_new_hire_trigger(text: str) -> bool:
     if not text:
         return False
     head = text[:80]
-    return "入职信息确认" in head or "新人入职" in head
+    return any(keyword in head for keyword in ("入职信息确认", "新人入职", "中文花名"))
 
 
 def _apply_new_hire_defaults(
@@ -1524,7 +1524,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
         caption_keyword = has_onboarding_keyword(message.caption or "")
         if not image_keyword and not caption_keyword:
             await message.answer(
-                "这张图片中没有识别到“新人入职”或“入职信息确认”，因此没有写入花名册。"
+                "这张图片中没有识别到“新人入职”、“入职信息确认”或“中文花名”，因此没有写入花名册。"
                 "如需录入，请发送包含其中一个关键词的完整截图。"
             )
             return

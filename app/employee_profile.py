@@ -106,7 +106,7 @@ def parse_profile_message(text: str) -> tuple[str | None, dict[str, str]]:
 
 
 def has_onboarding_keyword(text: str) -> bool:
-    return any(keyword in text for keyword in ("新人入职", "入职信息确认"))
+    return any(keyword in text for keyword in ("新人入职", "入职信息确认", "中文花名"))
 
 
 def person_name_keys(value: str) -> set[str]:

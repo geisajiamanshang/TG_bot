@@ -1,12 +1,14 @@
 import unittest
 
 from app.employee_profile import (
+    has_onboarding_keyword,
     parse_extra_profile_fields,
     parse_profile_message,
     person_name_keys,
     validate_profile,
 )
 from app.bot import _candidate_profile_id
+from app.google_sheets_service import onboarding_identity_keys
 
 
 MESSAGE = """效能中心【入职信息确认】
@@ -28,6 +30,19 @@ MESSAGE = """效能中心【入职信息确认】
 
 
 class OnboardingRegressionTests(unittest.TestCase):
+    def test_chinese_flower_name_is_an_onboarding_trigger(self) -> None:
+        mode, values = parse_profile_message("中文花名：夏华\n姓名/简历名：姜先生")
+        self.assertTrue(has_onboarding_keyword("中文花名：夏华"))
+        self.assertEqual(mode, "new")
+        self.assertEqual(values["chinese_name"], "夏华")
+
+    def test_onboarding_identity_works_before_employee_code_exists(self) -> None:
+        candidate = {"employee_code": "", "resume_name": "姜先生", "chinese_name": "夏华"}
+        existing_change = {"employee_code": "姜先生", "chinese_name": "夏华"}
+        self.assertTrue(
+            onboarding_identity_keys(candidate) & onboarding_identity_keys(existing_change)
+        )
+
     def test_candidate_code_is_not_employee_code(self) -> None:
         mode, values = parse_profile_message(MESSAGE)
         self.assertEqual(mode, "new")

@@ -40,7 +40,7 @@ class VisionService:
                     {
                         "type": "input_text",
                         "text": (
-                            "先检查图片中是否明确出现‘新人入职’或‘入职信息确认’。"
+                            "先检查图片中是否明确出现‘新人入职’、‘入职信息确认’或‘中文花名’。"
                             "若出现，将原词写入trigger_keyword，否则填空字符串。"
                             "然后从截图提取以下字段："
                             + ", ".join(PROFILE_FIELDS)
@@ -97,7 +97,7 @@ class VisionService:
         if values.get("work_tg") and not values["work_tg"].startswith("@"):
             values.pop("work_tg", None)
         trigger = str(payload.get("trigger_keyword") or "").strip()
-        if trigger not in {"新人入职", "入职信息确认"}:
+        if trigger not in {"新人入职", "入职信息确认", "中文花名"}:
             trigger = ""
         return values, trigger
 

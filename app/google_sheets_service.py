@@ -92,6 +92,17 @@ DROPDOWN_STRUCTURE_COLUMNS = (
 FORMULA_COLUMNS = ("W", "X", "BB", "BE", "BG", "BJ")
 
 
+def onboarding_identity_keys(profile: dict[str, object]) -> set[str]:
+    """Stable keys used to keep one 入职 row per person, even before a code exists."""
+    keys: set[str] = set()
+    for field in ("employee_code", "resume_name", "chinese_name"):
+        value = str(profile.get(field) or "").strip()
+        if value:
+            keys.add(value.casefold())
+            keys.update(person_name_keys(value))
+    return keys
+
+
 class GoogleSheetsService:
     def __init__(
         self,
@@ -601,17 +612,59 @@ class GoogleSheetsService:
                 self._column_index("BJ") + 1,
                 dropdown_exclusions,
             )
-            if effective_new or reconcile_core:
+            # Reconfirmed onboarding rows may already exist as HR placeholders.
+            # Refresh every protected formula column (including BB) from a live
+            # template so BB evaluates to the roster-standard 0.0 instead of
+            # being left blank or carrying a hard-coded value.
+            if effective_new or reconcile_core or onboarding_event:
                 self._copy_roster_formulas(service, target_row)
             service.spreadsheets().values().batchUpdate(
                 spreadsheetId=self.spreadsheet_id,
                 body={"valueInputOption": "USER_ENTERED", "data": updates},
             ).execute()
 
-        if changes or written_extra_fields:
+        # An earlier sync may have written the roster but skipped the onboarding
+        # record (for example, before a six-character employee code was assigned).
+        # Reconciliation must therefore also retry the one-time 入职 record.
+        if changes or written_extra_fields or onboarding_event:
+            # When an onboarding submission matches a pre-existing roster row by
+            # name, use that live row as the source of truth for the change log.
+            # The inbound message may legitimately omit the already-assigned code
+            # and organization fields.
+            change_profile = dict(profile)
+            change_extra_fields = dict(written_extra_fields)
+            live_row = (
+                rows[target_row - ROSTER_START_ROW]
+                if target_row >= ROSTER_START_ROW
+                and target_row - ROSTER_START_ROW < len(rows)
+                else []
+            )
+
+            def live_value(column: str) -> str:
+                index = self._column_index(column)
+                return str(live_row[index]).strip() if len(live_row) > index else ""
+
+            if onboarding_event and live_row:
+                for key, column in (
+                    ("employee_code", "B"),
+                    ("chinese_name", "C"),
+                    ("resume_name", "D"),
+                    ("effective_date", "F"),
+                ):
+                    if not str(change_profile.get(key) or "").strip():
+                        change_profile[key] = live_value(column)
+                for key, column in (
+                    ("org_unit", "L"),
+                    ("service_entity", "N"),
+                    ("department", "O"),
+                    ("position_title", "T"),
+                    ("job_level", "U"),
+                    ("job_grade", "V"),
+                ):
+                    change_extra_fields.setdefault(key, live_value(column))
             self._append_change(
-                service, profile, changes, is_new or onboarding_event,
-                written_extra_fields,
+                service, change_profile, changes, is_new or onboarding_event,
+                change_extra_fields,
             )
         return target_row
 
@@ -654,27 +707,39 @@ class GoogleSheetsService:
             part for part in (str(extra.get("position_title", "")), level_grade) if part
         ) if is_new else ""
         rows = self._read_rows(service, CHANGE_SHEET, "A3:P")
+        matched_row = 0
+        matched_existing: list[object] = []
         if is_new:
-            employee_code = str(profile.get("employee_code") or "").strip().casefold()
-            # Column D is the sole employee identifier for onboarding changes.
-            # Without it, do not create an unidentifiable/undedupeable 入职 row.
-            if not employee_code:
-                logger.warning("Skipped onboarding change record without employee code")
+            identity_keys = onboarding_identity_keys(profile)
+            identifier = str(
+                profile.get("employee_code")
+                or profile.get("resume_name")
+                or profile.get("chinese_name")
+                or ""
+            ).strip()
+            if not identifier or not identity_keys:
+                logger.warning("Skipped onboarding change record without a stable identity")
                 return
-            for existing in rows:
+            for offset, existing in enumerate(rows):
                 change_type = str(existing[1] if len(existing) > 1 else "").strip()
                 if change_type != "入职":
                     continue
-                existing_code = str(existing[3] if len(existing) > 3 else "").strip().casefold()
-                if existing_code == employee_code:
+                existing_profile = {
+                    "employee_code": str(existing[3] if len(existing) > 3 else ""),
+                    "chinese_name": str(existing[4] if len(existing) > 4 else ""),
+                }
+                if identity_keys & onboarding_identity_keys(existing_profile):
+                    matched_row = CHANGE_START_ROW + offset
+                    matched_existing = existing
                     logger.info(
-                        "Skipped duplicate onboarding change record for employee %s (%s)",
-                        employee_code,
+                        "Updating existing onboarding change record for employee %s (%s)",
+                        identifier,
                         str(profile.get("chinese_name") or ""),
                     )
-                    return
-        row = self._last_used_row(rows, CHANGE_START_ROW) + 1
-        self._ensure_rows(service, CHANGE_SHEET_ID, row)
+                    break
+        row = matched_row or self._last_used_row(rows, CHANGE_START_ROW) + 1
+        if not matched_row:
+            self._ensure_rows(service, CHANGE_SHEET_ID, row)
         sequence_values = [int(str(item[0])) for item in rows if item and str(item[0]).isdigit()]
         effective_date = str(profile.get("effective_date") or datetime.now().date().isoformat())
         details = "；".join(
@@ -684,18 +749,28 @@ class GoogleSheetsService:
         if is_new:
             details = ""
         values = [[
-            max(sequence_values, default=0) + 1,
+            (
+                matched_existing[0]
+                if matched_existing and str(matched_existing[0]).strip()
+                else max(sequence_values, default=0) + 1
+            ),
             "入职" if is_new else "其他",
             effective_date,
-            str(profile.get("employee_code") or ""),
+            str(
+                profile.get("employee_code")
+                or profile.get("resume_name")
+                or profile.get("chinese_name")
+                or ""
+            ),
             str(profile.get("chinese_name") or ""),
             "", unit_after, "", position_level_after, "", "", "", "",
             details,
             "新人入职" if is_new else "员工字段变更（机器人）",
             int(effective_date[5:7]) if len(effective_date) >= 7 and effective_date[5:7].isdigit() else "",
         ]]
-        source_row = max(CHANGE_START_ROW, row - 1)
-        self._copy_row_rules(service, CHANGE_SHEET, CHANGE_SHEET_ID, source_row, row, 16)
+        if not matched_row:
+            source_row = max(CHANGE_START_ROW, row - 1)
+            self._copy_row_rules(service, CHANGE_SHEET, CHANGE_SHEET_ID, source_row, row, 16)
         service.spreadsheets().values().update(
             spreadsheetId=self.spreadsheet_id,
             range=f"'{CHANGE_SHEET}'!A{row}:P{row}",
