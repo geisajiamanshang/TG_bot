@@ -7,7 +7,7 @@ from app.employee_profile import (
     person_name_keys,
     validate_profile,
 )
-from app.bot import _candidate_profile_id
+from app.bot import _apply_new_hire_defaults, _candidate_profile_id
 from app.google_sheets_service import onboarding_identity_keys
 
 
@@ -30,6 +30,24 @@ MESSAGE = """效能中心【入职信息确认】
 
 
 class OnboardingRegressionTests(unittest.TestCase):
+    def test_performance_center_defaults_fill_team_and_indirect_supervisor(self) -> None:
+        values = {"effective_date": "2026-09-14"}
+        extra_fields = {"org_unit": "效能中心", "department": "效能部"}
+        _apply_new_hire_defaults(values, extra_fields, "效能中心")
+        self.assertEqual(extra_fields["team"], "先锋1组")
+        self.assertEqual(extra_fields["indirect_supervisor"], "白一舟")
+
+    def test_performance_center_defaults_do_not_override_explicit_values(self) -> None:
+        values = {"effective_date": "2026-09-14"}
+        extra_fields = {
+            "org_unit": "效能中心",
+            "team": "明确提供的小组",
+            "indirect_supervisor": "明确提供的上级",
+        }
+        _apply_new_hire_defaults(values, extra_fields, "效能中心")
+        self.assertEqual(extra_fields["team"], "明确提供的小组")
+        self.assertEqual(extra_fields["indirect_supervisor"], "明确提供的上级")
+
     def test_chinese_flower_name_is_an_onboarding_trigger(self) -> None:
         mode, values = parse_profile_message("中文花名：夏华\n姓名/简历名：姜先生")
         self.assertTrue(has_onboarding_keyword("中文花名：夏华"))

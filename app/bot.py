@@ -208,6 +208,7 @@ def _apply_new_hire_defaults(
     values.setdefault("employment_status", "试用期")
     for key, default_value in hr_defaults.NEW_HIRE_STATIC_DEFAULTS.items():
         extra_fields.setdefault(key, default_value)
+    hr_defaults.apply_org_specific_defaults(extra_fields, org_hint)
     extra_fields.setdefault("salary_currency", "CNY")
     if not extra_fields.get("hrbp"):
         hrbp = hr_defaults.resolve_hrbp(

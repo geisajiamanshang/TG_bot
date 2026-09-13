@@ -44,6 +44,15 @@ NEW_HIRE_STATIC_DEFAULTS: dict[str, str] = {
 }
 
 
+def apply_org_specific_defaults(extra_fields: dict[str, str], org_hint: str = "") -> None:
+    """Fill deterministic organization rules without overriding submitted values."""
+    org_unit = str(extra_fields.get("org_unit") or "").strip()
+    hint = str(org_hint or "").strip()
+    if org_unit == "效能中心" or "效能中心" in hint:
+        extra_fields.setdefault("team", "先锋1组")
+        extra_fields.setdefault("indirect_supervisor", "白一舟")
+
+
 def resolve_hrbp(*texts: str) -> str | None:
     """Match department/team/org_hint free text against the HRBP mapping
     table. Returns the mapped "姓名 @handle" string, or None if nothing
