@@ -12,6 +12,7 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
 from app.employee_profile import DISPLAY_LABELS, person_name_keys
+from app.hr_defaults import normalize_department, default_office_region
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +90,7 @@ DROPDOWN_STRUCTURE_COLUMNS = (
     "H", "I", "K", "M", "S", "U", "V", "W", "X", "AC", "AI", "AO", "AV", "AW", "AX", "BA", "BC", "BE",
 )
 
-FORMULA_COLUMNS = ("W", "X", "BB", "BE", "BG", "BJ")
+FORMULA_COLUMNS = ("W", "X", "BE", "BG", "BJ")
 
 
 def onboarding_identity_keys(profile: dict[str, object]) -> set[str]:
@@ -549,6 +550,8 @@ class GoogleSheetsService:
                 value = str(profile.get(key) or "")
                 if key == "age_range":
                     value = value.replace("25以下", "25 以下").replace("51以上", "51 以上")
+                elif key == "office_region":
+                    value = default_office_region(value)
                 elif key == "birthday_month":
                     month = "".join(character for character in value if character.isdigit())
                     if month and 1 <= int(month) <= 12:
@@ -563,6 +566,8 @@ class GoogleSheetsService:
         written_extra_fields: dict[str, str] = {}
         if extra_fields:
             for extra_key, extra_value in extra_fields.items():
+                if extra_key == "department":
+                    extra_value = normalize_department(str(extra_value))
                 # Fixed HR business-rule defaults (app/hr_defaults.py) are only ever meant
                 # for a brand-new roster row -- never let them overwrite a field HR has
                 # since edited on an existing employee's row.
@@ -592,6 +597,9 @@ class GoogleSheetsService:
                         continue
                     updates.append({"range": f"'{ROSTER_SHEET}'!{extra_column}{target_row}", "values": [[extra_value]]})
                     written_extra_fields[extra_key] = str(extra_value)
+        # 入职司龄固定数值零，沿用原表的0.0显示格式；其他公式列不变。
+        if is_new or onboarding_event:
+            updates.append({"range": f"'{ROSTER_SHEET}'!BB{target_row}", "values": [[0.0]]})
         if updates:
             source_row = max(
                 (ROSTER_START_ROW + index for index, item in enumerate(rows[: max(0, target_row - ROSTER_START_ROW)]) if len(item) > 1 and str(item[1]).strip()),

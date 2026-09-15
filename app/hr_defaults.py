@@ -90,7 +90,11 @@ def default_nationality(value: str) -> str:
 
 def default_office_region(value: str) -> str:
     text = normalize_region_like(value)
-    return text or "中国大陆"
+    return "中国大陆" if not text or text == "中国" else text
+
+
+def normalize_department(value: str) -> str:
+    return value.strip().replace("运营一部", "运营1部").replace("运营二部", "运营2部")
 
 
 def probation_end_date(effective_date: str) -> str:
