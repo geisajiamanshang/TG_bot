@@ -6,6 +6,7 @@ After=network-online.target docker.service
 [Service]
 Type=oneshot
 WorkingDirectory=/root/ssc-bot
+Environment=HOME=/root
 ExecStart=/usr/local/sbin/ssc-bot-autodeploy
 TimeoutStartSec=15min
 UMask=0077
