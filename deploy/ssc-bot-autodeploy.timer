@@ -1,0 +1,11 @@
+[Unit]
+Description=Check SSC bot GitHub main every five minutes
+
+[Timer]
+OnBootSec=90s
+OnUnitInactiveSec=300s
+AccuracySec=5s
+Unit=ssc-bot-autodeploy.service
+
+[Install]
+WantedBy=timers.target
