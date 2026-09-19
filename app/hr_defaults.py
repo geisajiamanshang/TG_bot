@@ -90,7 +90,10 @@ def default_nationality(value: str) -> str:
 
 def default_office_region(value: str) -> str:
     text = normalize_region_like(value)
-    return "中国大陆" if not text or text == "中国" else text
+    compact = text.replace(" ", "")
+    if not compact or compact in {"中国", "国内", "中国境内", "大陆", "中国大陆"}:
+        return "中国大陆"
+    return text
 
 
 def normalize_department(value: str) -> str:

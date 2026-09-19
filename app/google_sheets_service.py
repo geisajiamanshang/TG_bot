@@ -90,7 +90,7 @@ DROPDOWN_STRUCTURE_COLUMNS = (
     "H", "I", "K", "M", "S", "U", "V", "W", "X", "AC", "AI", "AO", "AV", "AW", "AX", "BA", "BC", "BE",
 )
 
-FORMULA_COLUMNS = ("W", "X", "BE", "BG", "BJ")
+FORMULA_COLUMNS = ("W", "X", "BB", "BE", "BG", "BJ")
 
 
 def onboarding_identity_keys(profile: dict[str, object]) -> set[str]:
@@ -597,9 +597,6 @@ class GoogleSheetsService:
                         continue
                     updates.append({"range": f"'{ROSTER_SHEET}'!{extra_column}{target_row}", "values": [[extra_value]]})
                     written_extra_fields[extra_key] = str(extra_value)
-        # 入职司龄固定数值零，沿用原表的0.0显示格式；其他公式列不变。
-        if is_new or onboarding_event:
-            updates.append({"range": f"'{ROSTER_SHEET}'!BB{target_row}", "values": [[0.0]]})
         if updates:
             source_row = max(
                 (ROSTER_START_ROW + index for index, item in enumerate(rows[: max(0, target_row - ROSTER_START_ROW)]) if len(item) > 1 and str(item[1]).strip()),

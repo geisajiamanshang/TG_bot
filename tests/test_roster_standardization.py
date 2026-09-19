@@ -10,7 +10,11 @@ class StandardizationTests(unittest.TestCase):
 
     def test_region(self):
         self.assertEqual(default_office_region('中国'), '中国大陆')
+        self.assertEqual(default_office_region('国内'), '中国大陆')
+        self.assertEqual(default_office_region('中国境内'), '中国大陆')
+        self.assertEqual(default_office_region('大陆'), '中国大陆')
+        self.assertEqual(default_office_region('中国香港'), '中国香港')
 
-    def test_bb_is_not_copied_as_formula(self):
-        self.assertNotIn('BB', FORMULA_COLUMNS)
+    def test_formula_columns_are_copied_from_live_roster(self):
+        self.assertIn('BB', FORMULA_COLUMNS)
         self.assertIn('BJ', FORMULA_COLUMNS)
