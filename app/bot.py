@@ -70,9 +70,12 @@ class InboundAuditMiddleware(BaseMiddleware):
             if _is_admin(user.id, self.services.settings):
                 state: FSMContext | None = data.get("state")
                 current_state = await state.get_state() if state else None
-                is_image = content_type == "photo" or (
-                    content_type == "document"
-                    and bool(event.document and (event.document.mime_type or "").startswith("image/"))
+                # NOTE: event.content_type is an aiogram ContentType enum member; str() on it
+                # yields "ContentType.PHOTO", not "photo", so comparing against the plain
+                # string literal here always failed and silently swallowed every screenshot
+                # sent during an attendance-check session. Check the actual payload instead.
+                is_image = bool(event.photo) or bool(
+                    event.document and (event.document.mime_type or "").startswith("image/")
                 )
                 is_cancel = bool(event.text and event.text.strip().casefold().startswith("/cancel"))
                 if (
@@ -87,9 +90,8 @@ class InboundAuditMiddleware(BaseMiddleware):
             if not _is_admin(user.id, self.services.settings):
                 bot: Bot = data["bot"]
                 now = datetime.now(UTC)
-                is_screenshot = content_type == "photo" or (
-                    content_type == "document"
-                    and bool(event.document and (event.document.mime_type or "").startswith("image/"))
+                is_screenshot = bool(event.photo) or bool(
+                    event.document and (event.document.mime_type or "").startswith("image/")
                 )
                 attendance_result = await self.services.db.record_attendance_response(
                     user.id,
