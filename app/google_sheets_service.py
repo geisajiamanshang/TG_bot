@@ -202,7 +202,12 @@ class GoogleSheetsService:
 
     def _attendance_contacts(self, chinese_names: list[str]) -> list[dict[str, str]]:
         service = self._service()
-        rows = self._read_rows(service, ROSTER_SHEET, "C4:AD5000")
+        # 花名可能只登记在其中一张表：表格一（可编辑，self.spreadsheet_id）用于新人信息
+        # 录入，表格二（只读，self.roster_spreadsheet_id，/sync 同步用）是正式花名册。两张
+        # 表结构一致（C 花名、AD 工作TG），考勤抽查需要两张表都查，找不到再换另一张。
+        rows = list(self._read_rows(service, ROSTER_SHEET, "C4:AD5000", self.spreadsheet_id))
+        if self.roster_spreadsheet_id and self.roster_spreadsheet_id != self.spreadsheet_id:
+            rows.extend(self._read_rows(service, ROSTER_SHEET, "C4:AD5000", self.roster_spreadsheet_id))
 
         def key(value: object) -> str:
             return "".join(str(value or "").split()).casefold()

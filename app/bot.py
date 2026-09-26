@@ -1232,14 +1232,15 @@ def build_dispatcher(services: Services) -> Dispatcher:
         await state.update_data(
             attendance_template_id=attendance_template[0],
             activation_template_id=activation_template[0],
-            attendance_targets=[],
-            activation_targets=[],
-            attendance_issues=[],
-            attendance_names=[],
+            attendance_sent_ids=[],
+            attendance_reported_tg=[],
         )
         await message.answer(
-            "请发送包含员工花名的考勤截图。机器人会核对花名册 C 列花名和 AD 列工作 TG。\n\n"
-            "识别后只生成发送预览；在您确认前不会发送任何消息。发送 /cancel 可取消。"
+            "请发送包含员工花名的考勤截图，可以连续发送多张。机器人会核对花名册（表格一、表格二）"
+            "C 列花名和 AD 列工作 TG：\n"
+            "· 已激活机器人的员工会立即收到考勤抽查通知；\n"
+            "· 未激活的员工，机器人会把姓名、工作 TG 和激活提示语直接回复给您，方便手动转发。\n\n"
+            "发送 /cancel 结束本轮抽查，否则会一直等待下一张截图。"
         )
 
     @router.message(
@@ -1263,7 +1264,15 @@ def build_dispatcher(services: Services) -> Dispatcher:
             sheet_results = await services.sheets.attendance_contacts(names)
         except Exception:
             logger.exception("Attendance screenshot processing failed for %s", message.from_user.id)
-            await message.answer("截图识别或花名册核对失败；当前未发送任何消息。")
+            await message.answer("截图识别或花名册核对失败，请重新发送这张截图；考勤抽查仍在等待中。")
+            return
+
+        state_data = await state.get_data()
+        attendance_template = await services.db.template(int(state_data.get("attendance_template_id") or 0))
+        activation_template = await services.db.template(int(state_data.get("activation_template_id") or 0))
+        if not attendance_template or not activation_template:
+            await state.clear()
+            await message.answer("考勤相关模板已失效，请重新执行 /attendance_check。")
             return
 
         employees = await services.db.active_employees()
@@ -1271,23 +1280,16 @@ def build_dispatcher(services: Services) -> Dispatcher:
             employee.username.strip().lstrip("@").casefold(): employee
             for employee in employees if employee.username and employee.username.strip().lstrip("@")
         }
-        state_data = await state.get_data()
-        attendance_by_id = {
-            int(item["telegram_user_id"]): item
-            for item in list(state_data.get("attendance_targets") or [])
-        }
-        activation_by_tg = {
-            str(item["work_tg"]).lstrip("@").casefold(): item
-            for item in list(state_data.get("activation_targets") or [])
-        }
-        issues = list(state_data.get("attendance_issues") or [])
-        recognized_names = list(state_data.get("attendance_names") or [])
-        recognized_keys = {"".join(str(item).split()).casefold() for item in recognized_names}
-        for name in names:
-            normalized_name = "".join(name.split()).casefold()
-            if normalized_name not in recognized_keys:
-                recognized_keys.add(normalized_name)
-                recognized_names.append(name)
+        # 同一轮 /attendance_check 里（直到 /cancel 之前）已经处理过的人不重复发送/重复上报，
+        # 即便他们的花名又出现在后面发来的截图里。
+        sent_ids: set[int] = {int(value) for value in state_data.get("attendance_sent_ids") or []}
+        reported_tg: set[str] = {str(value) for value in state_data.get("attendance_reported_tg") or []}
+
+        sent_this_round: list[tuple[str, str]] = []
+        activation_this_round: list[dict[str, str]] = []
+        issues: list[str] = []
+        delay = 1 / services.settings.broadcast_messages_per_second
+
         for result in sheet_results:
             name = str(result.get("chinese_name") or result.get("requested_name") or "")
             status = str(result.get("status") or "")
@@ -1301,200 +1303,81 @@ def build_dispatcher(services: Services) -> Dispatcher:
                 issues.append(f"{name}：同名行的 AD 列不一致，需人工核对")
                 continue
             work_tg = str(result.get("work_tg") or "")
-            employee = employee_by_username.get(work_tg.lstrip("@").casefold())
+            username_key = work_tg.lstrip("@").casefold()
+            employee = employee_by_username.get(username_key)
             if employee:
-                attendance_by_id[employee.telegram_user_id] = {
-                    "telegram_user_id": employee.telegram_user_id,
-                    "chinese_name": name,
-                    "work_tg": work_tg,
-                }
-                activation_by_tg.pop(work_tg.lstrip("@").casefold(), None)
-            else:
-                activation_by_tg[work_tg.lstrip("@").casefold()] = {
-                    "chinese_name": name, "work_tg": work_tg
-                }
-
-        attendance_targets = list(attendance_by_id.values())
-        activation_targets = list(activation_by_tg.values())
-        issues = list(dict.fromkeys(issues))
-        attendance_template = await services.db.template(int(state_data.get("attendance_template_id") or 0))
-        activation_template = await services.db.template(int(state_data.get("activation_template_id") or 0))
-        if not attendance_template or not activation_template:
-            await state.clear()
-            await message.answer("考勤相关模板已失效；当前未发送任何消息。")
-            return
-        await state.update_data(
-            attendance_targets=attendance_targets,
-            activation_targets=activation_targets,
-            attendance_issues=issues,
-            attendance_names=recognized_names,
-        )
-        lines = [
-            "【考勤抽查发送预览】",
-            f"本张识别：{len(names)} 人｜本批累计：{len(recognized_names)} 人",
-            f"已登记，可发送考勤模板：{len(attendance_targets)} 人",
-            f"未登记，需发送激活模板：{len(activation_targets)} 人",
-            f"异常：{len(issues)} 人",
-        ]
-        if attendance_targets:
-            lines.append("\n考勤抽查名单：\n" + "\n".join(
-                f"{index}. {item['chinese_name']} · {item['work_tg']}"
-                for index, item in enumerate(attendance_targets, 1)
-            ))
-            lines.append(f"\n考勤模板：\n{attendance_template[2]}")
-        if activation_targets:
-            lines.append("\n未登记名单：\n" + "\n".join(
-                f"{index}. {item['chinese_name']} · {item['work_tg']}"
-                for index, item in enumerate(activation_targets, 1)
-            ))
-            lines.append(
-                f"\n激活模板：\n{activation_template[2]}\n"
-                "提示：Telegram 不允许机器人主动私聊从未 /start 的用户；确认后会生成可点击的人工转发清单。"
-            )
-        if issues:
-            lines.append("\n未进入发送范围：\n" + "\n".join(issues))
-        if not attendance_targets and not activation_targets:
-            await state.set_state(AttendanceCheck.waiting_for_screenshot)
-            await message.answer("\n".join(lines)[:3900] + "\n\n没有可处理对象，请核对后重新发送截图。")
-            return
-        # Keep the attendance session open so the next image is handled here instead
-        # of falling through to the onboarding screenshot handler. /cancel is the
-        # only operation that exits the session.
-        await state.set_state(AttendanceCheck.waiting_for_screenshot)
-        await message.answer(
-            "\n".join(lines)[:3700] + "\n\n可以继续发送下一张图片；名单会自动累计去重。",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="确认执行", callback_data="attendance:confirm"),
-                InlineKeyboardButton(text="取消", callback_data="attendance:cancel"),
-            ]]),
-        )
-
-    @router.callback_query(F.data == "attendance:cancel")
-    async def attendance_check_cancel(callback: CallbackQuery, state: FSMContext) -> None:
-        if not callback.from_user or not _is_admin(callback.from_user.id, services.settings):
-            await callback.answer("无权操作", show_alert=True)
-            return
-        await state.clear()
-        await callback.answer("已取消")
-        if callback.message:
-            await callback.message.edit_reply_markup(reply_markup=None)
-
-    @router.callback_query(AttendanceCheck.waiting_for_screenshot, F.data == "attendance:confirm")
-    async def attendance_check_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-        if not callback.from_user or not _is_admin(callback.from_user.id, services.settings):
-            await callback.answer("无权操作", show_alert=True)
-            return
-        data = await state.get_data()
-        targets = list(data.get("attendance_targets") or [])
-        activation_targets = list(data.get("activation_targets") or [])
-        attendance_template = await services.db.template(int(data.get("attendance_template_id") or 0))
-        activation_template = await services.db.template(int(data.get("activation_template_id") or 0))
-        if not attendance_template or not activation_template:
-            await state.clear()
-            await callback.answer("模板已经失效", show_alert=True)
-            return
-        if not targets and not activation_targets:
-            await callback.answer("当前批次已经处理或名单为空，请继续发送图片。", show_alert=True)
-            return
-        # Clear only the completed batch. Keep template ids and the attendance
-        # state so the administrator can immediately send more screenshots.
-        await state.set_state(AttendanceCheck.waiting_for_screenshot)
-        await state.update_data(
-            attendance_targets=[],
-            activation_targets=[],
-            attendance_issues=[],
-            attendance_names=[],
-        )
-        await callback.answer("开始执行")
-        if callback.message:
-            await callback.message.edit_reply_markup(reply_markup=None)
-            await callback.message.answer("已获得您的确认，正在发送考勤抽查……")
-
-        recipients = await services.db.active_employees_by_ids(
-            [int(item["telegram_user_id"]) for item in targets]
-        )
-        target_by_id = {int(item["telegram_user_id"]): item for item in targets}
-        successful: list[Employee] = []
-        failed: list[Employee] = []
-        delay = 1 / services.settings.broadcast_messages_per_second
-        for employee in recipients:
-            try:
-                await bot.send_message(employee.chat_id, attendance_template[2])
-                successful.append(employee)
+                if employee.telegram_user_id in sent_ids:
+                    continue
+                try:
+                    await bot.send_message(employee.chat_id, attendance_template[2])
+                except TelegramRetryAfter as exc:
+                    await asyncio.sleep(exc.retry_after + 0.5)
+                    try:
+                        await bot.send_message(employee.chat_id, attendance_template[2])
+                    except Exception:
+                        logger.exception("Attendance retry failed for user %s", employee.telegram_user_id)
+                        issues.append(f"{name}：发送失败，请重试")
+                        continue
+                except (TelegramForbiddenError, TelegramBadRequest):
+                    await services.db.deactivate_employee(employee.telegram_user_id)
+                    issues.append(f"{name}：发送失败（对方可能已拉黑或停用机器人，已标记为未激活）")
+                    continue
+                except Exception:
+                    logger.exception("Attendance send failed for user %s", employee.telegram_user_id)
+                    issues.append(f"{name}：发送失败，请重试")
+                    continue
+                sent_ids.add(employee.telegram_user_id)
+                sent_this_round.append((name, work_tg))
                 sent_at = datetime.now(UTC)
-                target = target_by_id[employee.telegram_user_id]
                 try:
                     await services.db.create_attendance_check(
-                        employee.telegram_user_id,
-                        str(target["chinese_name"]),
-                        str(target["work_tg"]),
+                        employee.telegram_user_id, name, work_tg,
                         sent_at.astimezone(ATTENDANCE_TIMEZONE).date().isoformat(),
-                        sent_at,
-                        sent_at + timedelta(minutes=20),
+                        sent_at, sent_at + timedelta(minutes=20),
                     )
                 except Exception:
                     logger.exception("Failed to persist attendance check for user %s", employee.telegram_user_id)
-            except TelegramRetryAfter as exc:
-                await asyncio.sleep(exc.retry_after + 0.5)
-                try:
-                    await bot.send_message(employee.chat_id, attendance_template[2])
-                    successful.append(employee)
-                    sent_at = datetime.now(UTC)
-                    target = target_by_id[employee.telegram_user_id]
-                    try:
-                        await services.db.create_attendance_check(
-                            employee.telegram_user_id,
-                            str(target["chinese_name"]),
-                            str(target["work_tg"]),
-                            sent_at.astimezone(ATTENDANCE_TIMEZONE).date().isoformat(),
-                            sent_at,
-                            sent_at + timedelta(minutes=20),
-                        )
-                    except Exception:
-                        logger.exception("Failed to persist attendance check for user %s", employee.telegram_user_id)
-                except Exception:
-                    logger.exception("Attendance retry failed for user %s", employee.telegram_user_id)
-                    failed.append(employee)
-            except (TelegramForbiddenError, TelegramBadRequest):
-                await services.db.deactivate_employee(employee.telegram_user_id)
-                failed.append(employee)
-            except Exception:
-                logger.exception("Attendance send failed for user %s", employee.telegram_user_id)
-                failed.append(employee)
-            await asyncio.sleep(delay)
+                await asyncio.sleep(delay)
+            else:
+                if username_key in reported_tg:
+                    continue
+                reported_tg.add(username_key)
+                activation_this_round.append({"chinese_name": name, "work_tg": work_tg})
 
-        broadcast_id = await services.db.save_broadcast(
-            callback.from_user.id, f"[考勤抽查]\n{attendance_template[2]}", len(successful), len(failed)
+        await state.update_data(
+            attendance_sent_ids=sorted(sent_ids),
+            attendance_reported_tg=sorted(reported_tg),
         )
-        if callback.message:
-            report = [
-                f"考勤抽查执行完成。记录 #{broadcast_id}",
-                f"考勤模板发送成功：{len(successful)}",
-                f"发送失败：{len(failed)}",
-            ]
-            if successful:
-                report.append("\n✅ 发送成功：\n" + "\n".join(
-                    f"{target_by_id[item.telegram_user_id]['chinese_name']} · "
-                    f"{target_by_id[item.telegram_user_id]['work_tg']}" for item in successful
-                ))
-            if failed:
-                report.append("\n❌ 发送失败：\n" + "\n".join(
-                    f"{target_by_id[item.telegram_user_id]['chinese_name']} · "
-                    f"{target_by_id[item.telegram_user_id]['work_tg']}" for item in failed
-                ))
-            if activation_targets:
-                links = "\n".join(
-                    f"{item['chinese_name']}：https://t.me/{str(item['work_tg']).lstrip('@')}"
-                    for item in activation_targets
-                )
-                report.append(
-                    f"\n⚠️ 以下员工从未激活机器人，机器人无法主动私聊。请人工转发：\n"
-                    f"{activation_template[2]}\n\n{links}"
-                )
-            await callback.message.answer(
-                "\n".join(report)[:3700]
-                + "\n\n考勤抽查仍在等待下一张图片；发送 /cancel 才会退出。"
+
+        lines = [f"本张识别到 {len(names)} 个花名。"]
+        if sent_this_round:
+            broadcast_id = await services.db.save_broadcast(
+                message.from_user.id, f"[考勤抽查]\n{attendance_template[2]}",
+                len(sent_this_round), 0,
             )
+            lines.append(
+                f"\n✅ 已直接发送考勤抽查通知（记录 #{broadcast_id}）：\n" + "\n".join(
+                    f"{index}. {person_name} · {tg}"
+                    for index, (person_name, tg) in enumerate(sent_this_round, 1)
+                )
+            )
+        if activation_this_round:
+            links = "\n".join(
+                f"{item['chinese_name']}：{item['work_tg']}"
+                f"（https://t.me/{str(item['work_tg']).lstrip('@')}）"
+                for item in activation_this_round
+            )
+            lines.append(
+                "\n⚠️ 以下人员尚未激活机器人（从未 /start），机器人无法主动私聊，"
+                "请人工转发下面这条激活提示语：\n"
+                f"{links}\n\n激活提示语（可直接复制粘贴）：\n{activation_template[2]}"
+            )
+        if issues:
+            lines.append("\n未处理：\n" + "\n".join(dict.fromkeys(issues)))
+        if not sent_this_round and not activation_this_round and not issues:
+            lines.append("这批花名都已经在本轮之前的截图里处理过了。")
+        lines.append("\n可以继续发送下一张截图；发送 /cancel 结束本轮抽查。")
+        await message.answer("\n".join(lines)[:3900])
 
     @router.message(F.photo | (F.document & F.document.mime_type.startswith("image/")))
     async def profile_screenshot(message: Message, bot: Bot) -> None:
