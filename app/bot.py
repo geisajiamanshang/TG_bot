@@ -78,9 +78,15 @@ class InboundAuditMiddleware(BaseMiddleware):
                     event.document and (event.document.mime_type or "").startswith("image/")
                 )
                 is_cancel = bool(event.text and event.text.strip().casefold().startswith("/cancel"))
+                # 截图识别不出来的时候，允许管理员直接发花名文字兜底（"张三 李四" /
+                # "张三，李四"），只要不是斜杠命令就当作花名文字放行，交给下面的
+                # attendance_check_text_names 处理；其它命令（/cancel 除外）仍然拦截提醒。
+                is_name_list = bool(
+                    event.text and event.text.strip() and not event.text.strip().startswith("/")
+                )
                 if (
                     current_state == AttendanceCheck.waiting_for_screenshot.state
-                    and not is_image and not is_cancel
+                    and not is_image and not is_cancel and not is_name_list
                 ):
                     await data["bot"].send_message(
                         event.chat.id,
@@ -255,6 +261,24 @@ async def _download_message_image(message: Message, bot: Bot) -> tuple[bytes, st
     buffer = io.BytesIO()
     await bot.download(file_id, destination=buffer)
     return buffer.getvalue(), mime_type or "image/jpeg"
+
+
+# 考勤抽查允许管理员在截图识别不出来的时候，直接用文字发花名兜底。支持用英文逗号、
+# 中文逗号、顿号或任意空白（包括全角空格）分隔多个花名，例如 "张三 李四" 或 "张三，李四"。
+_ATTENDANCE_NAME_SPLIT_RE = re.compile(r"[,，、\s]+")
+
+
+def _parse_attendance_name_list(text: str) -> list[str]:
+    candidates = _ATTENDANCE_NAME_SPLIT_RE.split(text.strip())
+    names: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        name = candidate.strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names
 
 
 def _selection_keyboard(
@@ -1242,31 +1266,20 @@ def build_dispatcher(services: Services) -> Dispatcher:
             "C 列花名和 AD 列工作 TG：\n"
             "· 已激活机器人的员工会立即收到考勤抽查通知；\n"
             "· 未激活的员工，机器人会把姓名、工作 TG 和激活提示语直接回复给您，方便手动转发。\n\n"
-            "发送 /cancel 结束本轮抽查，否则会一直等待下一张截图。"
+            "如果截图识别不出来，也可以直接发送花名文字兜底，支持空格或逗号分隔多个花名，"
+            "例如“张三 李四”或“张三，李四”。\n\n"
+            "发送 /cancel 结束本轮抽查，否则会一直等待下一张截图或花名文字。"
         )
 
-    @router.message(
-        AttendanceCheck.waiting_for_screenshot,
-        F.photo | (F.document & F.document.mime_type.startswith("image/")),
-    )
-    async def attendance_check_screenshot(message: Message, state: FSMContext, bot: Bot) -> None:
-        if not message.from_user or not _is_admin(message.from_user.id, services.settings):
-            await state.clear()
-            return
-        if message.document and message.document.file_size and message.document.file_size > 10 * 1024 * 1024:
-            await message.answer("图片文件过大，请压缩到 10 MB 以内后重试。")
-            return
-        await message.answer("正在识别花名并核对花名册，请稍候……")
+    async def _process_attendance_names(
+        message: Message, state: FSMContext, bot: Bot, names: list[str]
+    ) -> None:
+        """考勤抽查的核心比对/发送逻辑，截图识别和管理员直接发花名文字都走这里。"""
         try:
-            image, mime_type = await _download_message_image(message, bot)
-            names = await services.vision.extract_attendance_names(image, mime_type)
-            if not names:
-                await message.answer("没有识别到人员花名，请发送更清晰、完整的截图。")
-                return
             sheet_results = await services.sheets.attendance_contacts(names)
         except Exception:
-            logger.exception("Attendance screenshot processing failed for %s", message.from_user.id)
-            await message.answer("截图识别或花名册核对失败，请重新发送这张截图；考勤抽查仍在等待中。")
+            logger.exception("Attendance roster lookup failed for %s", message.from_user.id)
+            await message.answer("花名册核对失败，请重试；考勤抽查仍在等待中。")
             return
 
         state_data = await state.get_data()
@@ -1283,7 +1296,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
             for employee in employees if employee.username and employee.username.strip().lstrip("@")
         }
         # 同一轮 /attendance_check 里（直到 /cancel 之前）已经处理过的人不重复发送/重复上报，
-        # 即便他们的花名又出现在后面发来的截图里。
+        # 即便他们的花名又出现在后面发来的截图或文字里。
         sent_ids: set[int] = {int(value) for value in state_data.get("attendance_sent_ids") or []}
         reported_tg: set[str] = {str(value) for value in state_data.get("attendance_reported_tg") or []}
 
@@ -1351,7 +1364,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
             attendance_reported_tg=sorted(reported_tg),
         )
 
-        lines = [f"本张识别到 {len(names)} 个花名。"]
+        lines = [f"本次识别到 {len(names)} 个花名。"]
         if sent_this_round:
             broadcast_id = await services.db.save_broadcast(
                 message.from_user.id, f"[考勤抽查]\n{attendance_template[2]}",
@@ -1377,9 +1390,54 @@ def build_dispatcher(services: Services) -> Dispatcher:
         if issues:
             lines.append("\n未处理：\n" + "\n".join(dict.fromkeys(issues)))
         if not sent_this_round and not activation_this_round and not issues:
-            lines.append("这批花名都已经在本轮之前的截图里处理过了。")
-        lines.append("\n可以继续发送下一张截图；发送 /cancel 结束本轮抽查。")
+            lines.append("这批花名都已经在本轮之前处理过了。")
+        lines.append("\n可以继续发送下一张截图或花名文字；发送 /cancel 结束本轮抽查。")
         await message.answer("\n".join(lines)[:3900])
+
+    @router.message(
+        AttendanceCheck.waiting_for_screenshot,
+        F.photo | (F.document & F.document.mime_type.startswith("image/")),
+    )
+    async def attendance_check_screenshot(message: Message, state: FSMContext, bot: Bot) -> None:
+        if not message.from_user or not _is_admin(message.from_user.id, services.settings):
+            await state.clear()
+            return
+        if message.document and message.document.file_size and message.document.file_size > 10 * 1024 * 1024:
+            await message.answer("图片文件过大，请压缩到 10 MB 以内后重试。")
+            return
+        await message.answer("正在识别花名并核对花名册，请稍候……")
+        try:
+            image, mime_type = await _download_message_image(message, bot)
+            names = await services.vision.extract_attendance_names(image, mime_type)
+        except Exception:
+            logger.exception("Attendance screenshot processing failed for %s", message.from_user.id)
+            await message.answer(
+                "截图识别失败，请重新发送这张截图；也可以直接发送花名文字兜底"
+                "（例如“张三 李四”或“张三，李四”）。考勤抽查仍在等待中。"
+            )
+            return
+        if not names:
+            await message.answer(
+                "没有识别到人员花名，请发送更清晰、完整的截图；"
+                "如果截图始终识别不出来，也可以直接发送花名文字（例如“张三 李四”或“张三，李四”）。"
+            )
+            return
+        await _process_attendance_names(message, state, bot, names)
+
+    @router.message(AttendanceCheck.waiting_for_screenshot, F.text)
+    async def attendance_check_text_names(message: Message, state: FSMContext, bot: Bot) -> None:
+        if not message.from_user or not _is_admin(message.from_user.id, services.settings):
+            await state.clear()
+            return
+        names = _parse_attendance_name_list(message.text or "")
+        if not names:
+            await message.answer(
+                "没有识别到花名，请用空格或逗号分隔多个花名，例如“张三 李四”或“张三，李四”；"
+                "也可以直接发送考勤截图。"
+            )
+            return
+        await message.answer(f"正在核对花名册中的 {len(names)} 个花名，请稍候……")
+        await _process_attendance_names(message, state, bot, names)
 
     @router.message(F.photo | (F.document & F.document.mime_type.startswith("image/")))
     async def profile_screenshot(message: Message, bot: Bot) -> None:
