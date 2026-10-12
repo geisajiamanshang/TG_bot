@@ -446,7 +446,9 @@ async def _save_profile_values(
             except Exception as exc:
                 logger.exception("Google Sheets reconciliation failed for %s", target_user_id)
                 await services.db.set_profile_sync(target_user_id, f"error: {str(exc)}")
-                await message.answer("云表重新核对失败，已保留记录供管理员处理。")
+                await message.answer(
+                    "云表重新核对失败，已保留记录供管理员处理。\n原因：" + _sheet_error_reason(exc)
+                )
             return True
         if not services.sheets.configured:
             await message.answer(
@@ -467,13 +469,31 @@ async def _save_profile_values(
         except Exception as exc:
             logger.exception("Google Sheets sync failed for %s", target_user_id)
             await services.db.set_profile_sync(target_user_id, f"error: {str(exc)}")
-            sync_note = "本地已保存，但云表同步失败，管理员可检查后重试。"
+            sync_note = (
+                "本地已保存，但云表同步失败，管理员可检查后重试。\n原因："
+                + _sheet_error_reason(exc)
+            )
     changed_labels = "、".join(DISPLAY_LABELS.get(key, key) for key in changes)
     await message.answer(
         f"✅ {'新人档案已建立' if is_new else '字段已更新'}\n"
         f"变更字段：{changed_labels}\n{sync_note}\n\n{profile_text(saved)}"
     )
     return True
+
+
+def _sheet_error_reason(exc: Exception) -> str:
+    """把 Google 表格写入失败的原因翻译成管理员能直接处理的一句话。"""
+    text = str(exc)
+    lowered = text.casefold()
+    if "not supported for this document" in lowered:
+        return "目标表格是 Excel（.xlsx）文件，Google 接口无法写入；请在表格里“文件 → 另存为 Google 表格”，并把新表 ID 配置到 GOOGLE_SPREADSHEET_ID。"
+    if "permission" in lowered or "403" in lowered:
+        return "机器人服务账号没有该表格的编辑权限；请把表格共享给服务账号（编辑者）。"
+    if "404" in lowered or "not found" in lowered:
+        return "找不到目标表格或工作表；请检查 GOOGLE_SPREADSHEET_ID 和工作表名称（花名册 / 变更记录）。"
+    if "unable to parse range" in lowered:
+        return "目标表格里找不到“花名册”或“变更记录”工作表。"
+    return text[:300] or exc.__class__.__name__
 
 
 def build_dispatcher(services: Services) -> Dispatcher:
