@@ -71,6 +71,10 @@ class CandidateCodeTests(unittest.TestCase):
         self.assertEqual(data["'花名册'!D4"], "HJHT0000126")
         self.assertEqual(data["'花名册'!E4"], "测试甲")
         self.assertEqual(data["'花名册'!AR4"], "2026-10-12")
+        self.assertEqual(
+            data["'花名册'!BC4"],
+            '=IF(AR4="","",IF(AR4>TODAY(),0,ROUND(DATEDIF(AR4,TODAY(),"M")/12,1)))',
+        )
 
 
     def test_refuses_to_write_into_old_layout(self):

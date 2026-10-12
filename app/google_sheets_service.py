@@ -52,7 +52,6 @@ EXTRA_HR_DEFAULT_COLUMNS = {
     "work_mode": "AD", "salary_basis": "AM",
     "employment_type": "AW", "establishment_attribute": "AX", "establishment_status": "AY",
     "probation_months": "AZ", "probation_end_date": "BA",
-    "tenure_years": "BC",
     "latest_change_reason": "BG",
 }
 
@@ -95,6 +94,17 @@ DROPDOWN_STRUCTURE_COLUMNS = (
 FORMULA_COLUMNS = ("X", "Y", "BC", "BF", "BH", "BK")
 # 入职日期（AR）：新人入职时写入生效日期。
 HIRE_DATE_COLUMN = "AR"
+# 司龄（年）（BC）：始终写公式，随日期自动更新。
+TENURE_COLUMN = "BC"
+
+
+def tenure_formula(row: int) -> str:
+    """司龄公式：入职日期为空留空；入职日期在今天之后（还没入职）显示 0，避免 DATEDIF 报 #NUM!。"""
+    hire = f"{HIRE_DATE_COLUMN}{row}"
+    return (
+        f'=IF({hire}="","",IF({hire}>TODAY(),0,'
+        f'ROUND(DATEDIF({hire},TODAY(),"M")/12,1)))'
+    )
 # 花名册最后一列（转正日期（含延期））。
 ROSTER_LAST_COLUMN = "BK"
 
@@ -675,6 +685,11 @@ class GoogleSheetsService:
             # being left blank or carrying a hard-coded value.
             if effective_new or reconcile_core or onboarding_event:
                 self._copy_roster_formulas(service, target_row)
+                # 司龄始终用公式（覆盖模板公式和以前写死的 0.0），未来入职日期不再报 #NUM!。
+                updates.append({
+                    "range": f"'{ROSTER_SHEET}'!{TENURE_COLUMN}{target_row}",
+                    "values": [[tenure_formula(target_row)]],
+                })
             service.spreadsheets().values().batchUpdate(
                 spreadsheetId=self.spreadsheet_id,
                 body={"valueInputOption": "USER_ENTERED", "data": updates},

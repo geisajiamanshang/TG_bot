@@ -38,7 +38,7 @@ NEW_HIRE_STATIC_DEFAULTS: dict[str, str] = {
     "establishment_attribute": "正编",  # 编制属性
     "establishment_status": "在编",     # 编制状态
     "probation_months": "2",      # 试用期（月）
-    "tenure_years": "0.0",        # 司龄（年）
+    # 司龄（年）BC 列由机器人写入公式（见 google_sheets_service.tenure_formula），不写固定值。
     "latest_change_type": "入职",  # 最近异动类型
     "latest_change_reason": "新人入职",  # 最近异动原因
 }
