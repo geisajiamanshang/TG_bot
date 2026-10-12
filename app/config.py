@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     support_contact: str = "SSC 人工客服"
     bot_language: str = "zh-CN"
     broadcast_messages_per_second: float = Field(default=20, gt=0, le=25)
-    google_spreadsheet_id: str = "1OoNt1C0YyO4pBjle7eQjbuuepOpKk1gK8JlumdagGWM"
+    google_spreadsheet_id: str = "1cCAsC1qHTSJ32uDJlDFKTQ4mPkNbwV-x"
     google_roster_spreadsheet_id: str = "1DgnePrJOwA0sa8v4wJbv3RjFmdXvhGVN9f1TrTuzJng"
     google_service_account_file: str = "/run/secrets/google-service-account.json"
     wallet_spreadsheet_id: str = "1SrvH7LuKqlekXzUUxbMAY3VNT54ApXNqG6bki9bnhXQ"
