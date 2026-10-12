@@ -7,14 +7,14 @@ from app.google_sheets_service import GoogleSheetsService
 
 
 class ChannelSheetCandidateTests(unittest.TestCase):
-    def test_reads_c_ad_aq_and_filters_from_august(self):
+    def test_reads_c_ae_ar_and_filters_from_august(self):
         service = object.__new__(GoogleSheetsService)
         service.spreadsheet_id = "test"
         service._service = lambda: object()
         rows = [
-            ["七月员工"] + [""] * 26 + ["@july"] + [""] * 12 + ["2026-07-31"],
-            ["八月员工"] + [""] * 26 + ["@aug"] + [""] * 12 + ["2026-08-01"],
-            ["无TG员工"] + [""] * 27 + [""] * 12 + ["2026/09/10"],
+            ["七月员工"] + [""] * 27 + ["@july"] + [""] * 12 + ["2026-07-31"],
+            ["八月员工"] + [""] * 27 + ["@aug"] + [""] * 12 + ["2026-08-01"],
+            ["无TG员工"] + [""] * 28 + [""] * 12 + ["2026/09/10"],
         ]
         service._read_rows = lambda *_args, **_kwargs: rows
 

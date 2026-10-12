@@ -1,12 +1,13 @@
 from app.google_sheets_service import GoogleSheetsService
 
 
-def test_attendance_contacts_reads_c_and_ad_without_writing(monkeypatch):
+def test_attendance_contacts_reads_c_and_ae_without_writing(monkeypatch):
     service = object.__new__(GoogleSheetsService)
+    service.spreadsheet_id = service.roster_spreadsheet_id = "test"
     monkeypatch.setattr(service, "_service", lambda: object())
     rows = [
-        ["春雨"] + [""] * 26 + ["@SpringRain"],
-        ["空谷"] + [""] * 27,
+        ["春雨"] + [""] * 27 + ["@SpringRain"],
+        ["空谷"] + [""] * 28,
     ]
     monkeypatch.setattr(service, "_read_rows", lambda *_args, **_kwargs: rows)
 
@@ -27,10 +28,11 @@ def test_attendance_contacts_reads_c_and_ad_without_writing(monkeypatch):
 
 def test_attendance_contacts_rejects_conflicting_duplicate_names(monkeypatch):
     service = object.__new__(GoogleSheetsService)
+    service.spreadsheet_id = service.roster_spreadsheet_id = "test"
     monkeypatch.setattr(service, "_service", lambda: object())
     rows = [
-        ["夜阑雨"] + [""] * 26 + ["@first"],
-        ["夜阑雨"] + [""] * 26 + ["@second"],
+        ["夜阑雨"] + [""] * 27 + ["@first"],
+        ["夜阑雨"] + [""] * 27 + ["@second"],
     ]
     monkeypatch.setattr(service, "_read_rows", lambda *_args, **_kwargs: rows)
 

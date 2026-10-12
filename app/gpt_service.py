@@ -103,7 +103,7 @@ class GPTService:
                     + "age_range只能是：25以下、26-30、31-35、36-40、41-45、46-50、51以上（按年龄换算到对应区间）；"
                     + "education只能是：本科、博士、大专、高中及以下、硕士。"
                     + "employee_code只能从标签‘员工编码’或‘员工编码（新）’提取，且必须正好6位；"
-                    + "绝对不要把‘候选人编码’当成employee_code。"
+                    + "绝对不要把‘候选人编码’当成employee_code；如果消息里有‘候选人编码’（例如HJHT0000126），原样提取到candidate_code，没有就留空。"
                     + "如果消息里提到了具体的部门/团队/编制/事业部等组织归属信息（哪怕只是随口一提，不是标准字段），"
                     + "原样摘录关键词到org_hint，不要编造，没提到就留空。"
                     + "如果消息里提到了试用期薪资或转正后薪资的具体数字，分别提取到trial_salary/confirmed_salary，"
@@ -128,7 +128,7 @@ class GPTService:
                 "org_unit", "job_sequence", "service_entity", "department", "team",
                 "position_type", "position_title", "job_level", "job_grade",
                 "mgmt_sequence", "work_mode", "recruitment_channel", "resume_source",
-                "salary_currency",
+                "salary_currency", "candidate_code",
             ]
             result = {
                 key: str(payload.get(key) or "").strip()

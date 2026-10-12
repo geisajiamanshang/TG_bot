@@ -16,5 +16,5 @@ class StandardizationTests(unittest.TestCase):
         self.assertEqual(default_office_region('中国香港'), '中国香港')
 
     def test_formula_columns_are_copied_from_live_roster(self):
-        self.assertIn('BB', FORMULA_COLUMNS)
-        self.assertIn('BJ', FORMULA_COLUMNS)
+        self.assertIn('BC', FORMULA_COLUMNS)
+        self.assertIn('BK', FORMULA_COLUMNS)

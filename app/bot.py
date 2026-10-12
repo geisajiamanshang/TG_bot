@@ -623,7 +623,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
         if not services.sheets.configured:
             await message.answer("Google 花名册尚未配置，无法检查。")
             return
-        await message.answer("正在只读检查花名册 AD、AQ 列和机器人个人发送记录……")
+        await message.answer("正在只读检查花名册 AE、AR 列和机器人个人发送记录……")
         month_start = datetime.now(ATTENDANCE_TIMEZONE).date().replace(day=1)
         try:
             candidates = await services.sheets.channel_message_candidates(month_start)
@@ -645,7 +645,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
             employee = employee_by_username.get(username) if username else None
             if not username:
                 key = item["chinese_name"].strip().casefold()
-                activation_needed[key] = {**item, "reason": "AD列工作TG为空，未激活"}
+                activation_needed[key] = {**item, "reason": "AE列工作TG为空，未激活"}
             elif not employee:
                 activation_needed[username] = {**item, "reason": "工作TG未激活机器人"}
             elif employee.telegram_user_id not in sent_ids:
@@ -656,7 +656,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
                 }
         if not activation_needed and not channel_needed:
             await message.answer(
-                f"✅ 检查完成：AQ列入职日期从{month_start.isoformat()}起的员工，"
+                f"✅ 检查完成：AR列入职日期从{month_start.isoformat()}起的员工，"
                 "均已激活并有“关注恒睿频道”发送记录。"
             )
             return
@@ -668,7 +668,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
         await state.clear()
         lines = [
             "【频道消息待处理名单】",
-            f"范围：花名册 AQ 入职日期 ≥ {month_start.isoformat()}（当月第一天）",
+            f"范围：花名册 AR 入职日期 ≥ {month_start.isoformat()}（当月第一天）",
             f"未激活：{len(activation_needed)} 人",
             f"已激活但未发频道消息：{len(channel_needed)} 人",
         ]
@@ -676,7 +676,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
             lines.append("\n【未激活机器人｜请管理员人工发送】")
             for index, item in enumerate(activation_needed.values(), 1):
                 username = str(item["work_tg"] or "").lstrip("@")
-                contact = f"https://t.me/{username}" if username else "AD列无工作TG，需人工补充"
+                contact = f"https://t.me/{username}" if username else "AE列无工作TG，需人工补充"
                 lines.append(
                     f"{index}. {item['chinese_name']}｜{item['work_tg'] or '无工作TG'}｜"
                     f"{item['hire_date']}｜{contact}"
@@ -793,13 +793,13 @@ def build_dispatcher(services: Services) -> Dispatcher:
             if successful:
                 lines.append("\n✅ 成功名单：\n" + "\n".join(
                     f"{target_names.get(str(item.telegram_user_id), item.full_name)} · "
-                    f"{target_work_tg.get(str(item.telegram_user_id), 'AD列无工作TG')}"
+                    f"{target_work_tg.get(str(item.telegram_user_id), 'AE列无工作TG')}"
                     for item in successful
                 ))
             if failed:
                 lines.append("\n❌ 失败名单：\n" + "\n".join(
                     f"{target_names.get(str(item.telegram_user_id), item.full_name)} · "
-                    f"{target_work_tg.get(str(item.telegram_user_id), 'AD列无工作TG')}"
+                    f"{target_work_tg.get(str(item.telegram_user_id), 'AE列无工作TG')}"
                     for item in failed
                 ))
             await callback.message.answer("\n".join(lines)[:3900])
@@ -1263,7 +1263,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
         )
         await message.answer(
             "请发送包含员工花名的考勤截图，可以连续发送多张。机器人会核对花名册（表格一、表格二）"
-            "C 列花名和 AD 列工作 TG：\n"
+            "C 列花名和 AE 列工作 TG：\n"
             "· 已激活机器人的员工会立即收到考勤抽查通知；\n"
             "· 未激活的员工，机器人会把姓名、工作 TG 和激活提示语直接回复给您，方便手动转发。\n\n"
             "如果截图识别不出来，也可以直接发送花名文字兜底，支持空格或逗号分隔多个花名，"
@@ -1312,10 +1312,10 @@ def build_dispatcher(services: Services) -> Dispatcher:
                 issues.append(f"{name}：花名册 C 列未找到")
                 continue
             if status == "missing_tg":
-                issues.append(f"{name}：AD 列工作 TG 为空")
+                issues.append(f"{name}：AE 列工作 TG 为空")
                 continue
             if status == "ambiguous":
-                issues.append(f"{name}：同名行的 AD 列不一致，需人工核对")
+                issues.append(f"{name}：同名行的 AE 列不一致，需人工核对")
                 continue
             work_tg = str(result.get("work_tg") or "")
             username_key = work_tg.lstrip("@").casefold()
@@ -1485,6 +1485,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
                 "team", "position_type", "position_title", "job_level",
                 "job_grade", "mgmt_sequence", "work_mode",
                 "recruitment_channel", "resume_source", "salary_currency",
+                "candidate_code",
             )
         }
         values = clean_screenshot_values(values)
@@ -1544,6 +1545,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
                         "team", "position_type", "position_title", "job_level",
                         "job_grade", "mgmt_sequence", "work_mode",
                         "recruitment_channel", "resume_source", "salary_currency",
+                        "candidate_code",
                     )
                 }
                 gpt_values = clean_screenshot_values(gpt_values)

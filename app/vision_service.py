@@ -59,7 +59,7 @@ class VisionService:
                             + "如果截图里用“候选人姓名”来称呼候选人/新人姓名，与“姓名/简历名”是同一个字段，同样提取到resume_name，不要单独处理或留空。"
                             + "严格禁止把候选人姓名或姓名/简历名写入chinese_name。chinese_name只能来自图片中明确的‘中文花名’或‘花名’标签。"
                             + "如果提取chinese_name，必须同时把图片里对应的原始标签写入chinese_name_source_label，且只能是‘中文花名’或‘花名’；否则两项都留空。"
-                            + "employee_code只能从‘员工编码’或‘员工编码（新）’提取且必须正好6位；绝对不要提取‘候选人编码’。"
+                            + "employee_code只能从‘员工编码’或‘员工编码（新）’提取且必须正好6位；绝对不要把‘候选人编码’当成employee_code；如果截图里有‘候选人编码’（例如HJHT0000126），原样提取到candidate_code，看不清就留空。"
                             + "明确提取这些扩展字段：入职编制组织→org_unit、人员性质→job_sequence、入职服务单位→service_entity、"
                             + "入职部门→department、小组→team、岗位类型→position_type、职位→position_title、"
                             + "建议职级拆分为job_level和job_grade、管理序列→mgmt_sequence、办公方式→work_mode、"
@@ -82,7 +82,7 @@ class VisionService:
             "org_unit", "job_sequence", "service_entity", "department", "team",
             "position_type", "position_title", "job_level", "job_grade",
             "mgmt_sequence", "work_mode", "recruitment_channel", "resume_source",
-            "salary_currency",
+            "salary_currency", "candidate_code",
         ]
         values = {
             key: str(payload.get(key) or "").strip()

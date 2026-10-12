@@ -18,40 +18,42 @@ logger = logging.getLogger(__name__)
 
 ROSTER_SHEET = "花名册"
 CHANGE_SHEET = "变更记录"
-ROSTER_SHEET_ID = 139264850
-CHANGE_SHEET_ID = 310862563
 ROSTER_START_ROW = 4
 CHANGE_START_ROW = 3
 ROSTER_COLUMNS = {
-    "employee_code": "B", "chinese_name": "C", "resume_name": "D",
-    "employment_status": "E", "effective_date": "F", "gender": "G",
-    "age_range": "H", "education": "I", "nationality": "J", "birthday_month": "K",
-    "office_region": "AB", "work_tg": "AD", "private_contact": "AE", "work_email": "AF",
+    "employee_code": "B", "chinese_name": "C", "resume_name": "E",
+    "employment_status": "F", "effective_date": "G", "gender": "H",
+    "age_range": "I", "education": "J", "nationality": "K", "birthday_month": "L",
+    "office_region": "AC", "work_tg": "AE", "private_contact": "AF", "work_email": "AG",
 }
 
 # Organizational fields that are consistent within a team/department, safe to copy from
 # an existing roster row that matches a department/team name mentioned in the inbound message.
 EXTRA_ORG_COLUMNS = {
-    "org_unit": "L", "job_sequence": "M", "service_entity": "N",
-    "department": "O", "team": "P", "hrbp": "R",
-    "position_type": "S", "position_title": "T", "job_level": "U",
-    "job_grade": "V", "direct_supervisor": "Z", "indirect_supervisor": "AA",
-    "work_mode": "AC", "recruitment_channel": "AO", "resume_source": "AP",
+    "org_unit": "M", "job_sequence": "N", "service_entity": "O",
+    "department": "P", "team": "Q", "hrbp": "S",
+    "position_type": "T", "position_title": "U", "job_level": "V",
+    "job_grade": "W", "direct_supervisor": "AA", "indirect_supervisor": "AB",
+    "work_mode": "AD", "recruitment_channel": "AP", "resume_source": "AQ",
+}
+# 候选人编码（D列）：只从消息/截图中明确的“候选人编码”标签原样提取，绝不从其他行参照。
+EXTRA_IDENTITY_COLUMNS = {
+    "candidate_code": "D",
 }
 # Salary fields extracted directly from the message when explicitly stated (never inferred
 # from other rows). Currency is always CNY per company policy.
 EXTRA_SALARY_COLUMNS = {
-    "salary_currency": "AI", "trial_salary": "AJ", "confirmed_salary": "AK",
+    "salary_currency": "AJ", "trial_salary": "AK", "confirmed_salary": "AL",
 }
 # Fixed HR business-rule defaults (see app/hr_defaults.py) applied only to brand-new
 # roster rows (is_new=True) -- never inferred from other rows, never used on updates.
 EXTRA_HR_DEFAULT_COLUMNS = {
-    "mgmt_headcount": "Y",
-    "work_mode": "AC", "salary_basis": "AL",
-    "employment_type": "AV", "establishment_attribute": "AW", "establishment_status": "AX",
-    "probation_months": "AY", "probation_end_date": "AZ",
-    "tenure_years": "BB",
-    "latest_change_reason": "BF",
+    "mgmt_headcount": "Z",
+    "work_mode": "AD", "salary_basis": "AM",
+    "employment_type": "AW", "establishment_attribute": "AX", "establishment_status": "AY",
+    "probation_months": "AZ", "probation_end_date": "BA",
+    "tenure_years": "BC",
+    "latest_change_reason": "BG",
 }
 
 # Fixed HR business-rule defaults (app/hr_defaults.py) that must never be written onto a
@@ -66,31 +68,35 @@ EXTRA_HR_DEFAULT_COLUMNS = {
 NEW_HIRE_ONLY_EXTRA_KEYS = frozenset(EXTRA_HR_DEFAULT_COLUMNS) | {"job_sequence", "service_entity"}
 
 DROPDOWN_ALLOWED = {
-    "E": {"在职", "试用期", "调入", "调出", "停薪留职"},
-    "G": {"男", "女"},
-    "H": {"25 以下", "26-30", "31-35", "36-40", "41-45", "46-50", "51 以上"},
-    "I": {"本科", "博士", "大专", "高中及以下", "硕士"},
-    "K": {f"{month}月" for month in range(1, 13)},
-    "M": {"派驻", "直属"},
-    "S": {"财务", "策划", "产品", "法务", "管理", "技术", "内容", "其他", "渠道", "人事", "商务", "设计", "市场", "销售", "行政", "研发", "运营", "质检", "HRBP", "SSC"},
-    "U": {*(f"P{i}" for i in range(1, 9)), *(f"M{i}" for i in range(1, 8))},
-    "V": {"1", "2", "3"},
-    "AC": {"远程", "集中办公室", "混合"},
-    "AI": {"CNY", "USD", "USDT", "HKD", "SGD", "TWD", "GBP", "EUR", "JPY", "KRW", "AED"},
-    "AO": {"员工内推", "中诚渠道", "猎头", "二次入职", "卓亚渠道", "万天渠道", "宏景渠道", "燎原社渠道", "星探队", "其他", "寻英渠道", "牧星渠道"},
-    "AV": {"全职", "外包", "实习", "劳务派遣"},
-    "AW": {"正编", "外包", "顾问"},
-    "AX": {"空缺", "冻结", "在编"},
+    "F": {"在职", "试用期", "调入", "调出", "停薪留职"},
+    "H": {"男", "女"},
+    "I": {"25 以下", "26-30", "31-35", "36-40", "41-45", "46-50", "51 以上"},
+    "J": {"本科", "博士", "大专", "高中及以下", "硕士"},
+    "L": {f"{month}月" for month in range(1, 13)},
+    "N": {"派驻", "直属"},
+    "T": {"财务", "策划", "产品", "法务", "管理", "技术", "内容", "其他", "渠道", "人事", "商务", "设计", "市场", "销售", "行政", "研发", "运营", "质检", "HRBP", "SSC"},
+    "V": {*(f"P{i}" for i in range(1, 9)), *(f"M{i}" for i in range(1, 8))},
+    "W": {"1", "2", "3"},
+    "AD": {"远程", "集中办公室", "混合"},
+    "AJ": {"CNY", "USD", "USDT", "HKD", "SGD", "TWD", "GBP", "EUR", "JPY", "KRW", "AED"},
+    "AP": {"员工内推", "中诚渠道", "猎头", "二次入职", "卓亚渠道", "万天渠道", "宏景渠道", "燎原社渠道", "星探队", "其他", "寻英渠道", "牧星渠道"},
+    "AW": {"全职", "外包", "实习", "劳务派遣"},
+    "AX": {"正编", "外包", "顾问"},
+    "AY": {"空缺", "冻结", "在编"},
 }
 
-# These columns must retain the roster's native dropdown validation. W, X and BE
+# These columns must retain the roster's native dropdown validation. X, Y and BF
 # are formula columns: their validation is preserved, but their values/formulas are
 # never written by this bot.
 DROPDOWN_STRUCTURE_COLUMNS = (
-    "H", "I", "K", "M", "S", "U", "V", "W", "X", "AC", "AI", "AO", "AV", "AW", "AX", "BA", "BC", "BE",
+    "I", "J", "L", "N", "T", "V", "W", "X", "Y", "AD", "AJ", "AP", "AW", "AX", "AY", "BB", "BD", "BF",
 )
 
-FORMULA_COLUMNS = ("W", "X", "BB", "BE", "BG", "BJ")
+FORMULA_COLUMNS = ("X", "Y", "BC", "BF", "BH", "BK")
+# 入职日期（AR）：新人入职时写入生效日期。
+HIRE_DATE_COLUMN = "AR"
+# 花名册最后一列（转正日期（含延期））。
+ROSTER_LAST_COLUMN = "BK"
 
 
 def onboarding_identity_keys(profile: dict[str, object]) -> set[str]:
@@ -131,6 +137,40 @@ class GoogleSheetsService:
             return str(json.loads(Path(self.credentials_file).read_text())["client_email"])
         except Exception:
             return None
+
+    def _sheet_id(self, service, title: str) -> int:
+        """Resolve a tab's numeric sheetId by its title (gid differs between files)."""
+        cache = self.__dict__.setdefault("_sheet_id_cache", {})
+        key = (self.spreadsheet_id, title)
+        if key not in cache:
+            metadata = service.spreadsheets().get(
+                spreadsheetId=self.spreadsheet_id, fields="sheets.properties(sheetId,title)"
+            ).execute()
+            for sheet in metadata.get("sheets", []):
+                props = sheet.get("properties", {})
+                cache[(self.spreadsheet_id, props.get("title"))] = int(props.get("sheetId", 0))
+            if key not in cache:
+                raise ValueError(f"Google 表格中找不到工作表：{title}")
+        return cache[key]
+
+    def _assert_roster_layout(self, service) -> None:
+        """Refuse to write unless the roster uses the V1.4.0 layout (D=候选人编码, E=姓名/简历名).
+
+        Every column letter in this module assumes that layout; writing into an older
+        roster (where D is 姓名/简历名) would shift every value one column to the left.
+        """
+        checked = self.__dict__.setdefault("_layout_checked", set())
+        if self.spreadsheet_id in checked:
+            return
+        header = (self._read_rows(service, ROSTER_SHEET, "A3:E3") or [[]])[0]
+        header_d = str(header[3] if len(header) > 3 else "").strip()
+        header_e = str(header[4] if len(header) > 4 else "").strip()
+        if header_d != "候选人编码" or not header_e.startswith("姓名"):
+            raise ValueError(
+                "花名册表头与机器人列位置不一致（D3 应为“候选人编码”、E3 应为“姓名/简历名”），"
+                "已停止写入。请检查 GOOGLE_SPREADSHEET_ID 是否指向新版花名册。"
+            )
+        checked.add(self.spreadsheet_id)
 
     def _service(self):
         credentials = Credentials.from_service_account_file(
@@ -197,17 +237,17 @@ class GoogleSheetsService:
         return result.get("values", [])
 
     async def attendance_contacts(self, chinese_names: list[str]) -> list[dict[str, str]]:
-        """Read-only lookup: match 花名册 C 花名 and return AD 工作TG."""
+        """Read-only lookup: match 花名册 C 花名 and return AE 工作TG."""
         return await asyncio.to_thread(self._attendance_contacts, chinese_names)
 
     def _attendance_contacts(self, chinese_names: list[str]) -> list[dict[str, str]]:
         service = self._service()
         # 花名可能只登记在其中一张表：表格一（可编辑，self.spreadsheet_id）用于新人信息
         # 录入，表格二（只读，self.roster_spreadsheet_id，/sync 同步用）是正式花名册。两张
-        # 表结构一致（C 花名、AD 工作TG），考勤抽查需要两张表都查，找不到再换另一张。
-        rows = list(self._read_rows(service, ROSTER_SHEET, "C4:AD5000", self.spreadsheet_id))
+        # 表结构一致（C 花名、AE 工作TG），考勤抽查需要两张表都查，找不到再换另一张。
+        rows = list(self._read_rows(service, ROSTER_SHEET, "C4:AE5000", self.spreadsheet_id))
         if self.roster_spreadsheet_id and self.roster_spreadsheet_id != self.spreadsheet_id:
-            rows.extend(self._read_rows(service, ROSTER_SHEET, "C4:AD5000", self.roster_spreadsheet_id))
+            rows.extend(self._read_rows(service, ROSTER_SHEET, "C4:AE5000", self.roster_spreadsheet_id))
 
         def key(value: object) -> str:
             return "".join(str(value or "").split()).casefold()
@@ -217,8 +257,9 @@ class GoogleSheetsService:
             flower_name = str(row[0] if row else "").strip()
             if not flower_name:
                 continue
-            # C:AD contains 28 columns; AD is offset 27 from C.
-            work_tg = str(row[27] if len(row) > 27 else "").strip()
+            # Read starts at C, so AE 工作TG is offset AE - C.
+            tg_offset = self._column_index(ROSTER_COLUMNS["work_tg"]) - self._column_index("C")
+            work_tg = str(row[tg_offset] if len(row) > tg_offset else "").strip()
             by_name.setdefault(key(flower_name), []).append(
                 (row_number, flower_name, work_tg)
             )
@@ -266,17 +307,19 @@ class GoogleSheetsService:
     async def channel_message_candidates(
         self, since_date: date
     ) -> list[dict[str, str]]:
-        """Read-only C/AD/AQ lookup for employees hired on or after since_date."""
+        """Read-only C/AE/AR lookup for employees hired on or after since_date."""
         return await asyncio.to_thread(self._channel_message_candidates, since_date)
 
     def _channel_message_candidates(self, since_date: date) -> list[dict[str, str]]:
         service = self._service()
-        rows = self._read_rows(service, ROSTER_SHEET, "C4:AQ5000")
+        rows = self._read_rows(service, ROSTER_SHEET, f"C4:{HIRE_DATE_COLUMN}5000")
+        tg_offset = self._column_index(ROSTER_COLUMNS["work_tg"]) - self._column_index("C")
+        hire_offset = self._column_index(HIRE_DATE_COLUMN) - self._column_index("C")
         results: list[dict[str, str]] = []
         for row_number, row in enumerate(rows, start=ROSTER_START_ROW):
             chinese_name = str(row[0] if row else "").strip()
-            work_tg = str(row[27] if len(row) > 27 else "").strip()
-            hire_date_text = str(row[40] if len(row) > 40 else "").strip()
+            work_tg = str(row[tg_offset] if len(row) > tg_offset else "").strip()
+            hire_date_text = str(row[hire_offset] if len(row) > hire_offset else "").strip()
             if not chinese_name or not hire_date_text:
                 continue
             normalized_date = hire_date_text.replace("/", "-").replace(".", "-")
@@ -284,7 +327,7 @@ class GoogleSheetsService:
                 hire_date = date.fromisoformat(normalized_date)
             except ValueError:
                 logger.warning(
-                    "Skipped unparseable AQ hire date at roster row %s: %r",
+                    "Skipped unparseable AR hire date at roster row %s: %r",
                     row_number, hire_date_text,
                 )
                 continue
@@ -359,7 +402,7 @@ class GoogleSheetsService:
             # dropdown column and apply that rule to the destination row.
             validation_result = service.spreadsheets().get(
                 spreadsheetId=self.spreadsheet_id,
-                ranges=[f"'{ROSTER_SHEET}'!H{ROSTER_START_ROW}:BE{target_row}"],
+                ranges=[f"'{ROSTER_SHEET}'!I{ROSTER_START_ROW}:BF{target_row}"],
                 includeGridData=True,
                 fields="sheets.data.rowData.values(dataValidation)",
             ).execute()
@@ -375,7 +418,7 @@ class GoogleSheetsService:
                     # to have no dropdown validation at all.
                     cells[absolute_index].pop("dataValidation", None)
                     continue
-                relative_index = absolute_index - self._column_index("H")
+                relative_index = absolute_index - self._column_index("I")
                 rule = next(
                     (
                         row.get("values", [])[relative_index].get("dataValidation")
@@ -402,7 +445,7 @@ class GoogleSheetsService:
         """Copy only established per-row formulas, adjusted by Google Sheets."""
         result = service.spreadsheets().get(
             spreadsheetId=self.spreadsheet_id,
-            ranges=[f"'{ROSTER_SHEET}'!W{ROSTER_START_ROW}:BJ{target_row}"],
+            ranges=[f"'{ROSTER_SHEET}'!X{ROSTER_START_ROW}:{ROSTER_LAST_COLUMN}{target_row}"],
             includeGridData=True,
             fields="sheets.data.rowData.values(userEnteredValue)",
         ).execute()
@@ -412,7 +455,8 @@ class GoogleSheetsService:
             .get("rowData", [])
         )
         requests = []
-        base_index = self._column_index("W")
+        roster_sheet_id = self._sheet_id(service, ROSTER_SHEET)
+        base_index = self._column_index("X")
         for column in FORMULA_COLUMNS:
             absolute_index = self._column_index(column)
             relative_index = absolute_index - base_index
@@ -430,14 +474,14 @@ class GoogleSheetsService:
             source_index = ROSTER_START_ROW - 1 + source_offset
             requests.append({"copyPaste": {
                 "source": {
-                    "sheetId": ROSTER_SHEET_ID,
+                    "sheetId": roster_sheet_id,
                     "startRowIndex": source_index,
                     "endRowIndex": source_index + 1,
                     "startColumnIndex": absolute_index,
                     "endColumnIndex": absolute_index + 1,
                 },
                 "destination": {
-                    "sheetId": ROSTER_SHEET_ID,
+                    "sheetId": roster_sheet_id,
                     "startRowIndex": target_row - 1,
                     "endRowIndex": target_row,
                     "startColumnIndex": absolute_index,
@@ -479,9 +523,11 @@ class GoogleSheetsService:
         onboarding_event: bool = False,
     ) -> int:
         service = self._service()
-        # Read through BG so idempotency checks can see salary, recruiting,
-        # employment and latest-change fields, not only the core profile through AF.
-        rows = self._read_rows(service, ROSTER_SHEET, "A4:BG")
+        self._assert_roster_layout(service)
+        # Read through BH so idempotency checks can see salary, recruiting,
+        # employment and latest-change fields, not only the core profile through AG.
+        rows = self._read_rows(service, ROSTER_SHEET, "A4:BH")
+        resume_index = self._column_index(ROSTER_COLUMNS["resume_name"])
         employee_code = str(profile.get("employee_code") or "")
         if employee_code and len(employee_code) != 6:
             raise ValueError("员工编码必须为6位，候选人编码不能写入员工编码列")
@@ -495,7 +541,7 @@ class GoogleSheetsService:
         if stored_row >= ROSTER_START_ROW and stored_row - ROSTER_START_ROW < len(rows):
             stored_values = rows[stored_row - ROSTER_START_ROW]
             stored_name_keys = (
-                person_name_keys(str(stored_values[3] if len(stored_values) > 3 else ""))
+                person_name_keys(str(stored_values[resume_index] if len(stored_values) > resume_index else ""))
                 | person_name_keys(str(stored_values[2] if len(stored_values) > 2 else ""))
             )
             if profile_name_keys & stored_name_keys:
@@ -512,7 +558,7 @@ class GoogleSheetsService:
                     ROSTER_START_ROW + offset
                     for offset, row in enumerate(rows)
                     if profile_name_keys & (
-                        person_name_keys(str(row[3] if len(row) > 3 else ""))
+                        person_name_keys(str(row[resume_index] if len(row) > resume_index else ""))
                         | person_name_keys(str(row[2] if len(row) > 2 else ""))
                     )
                 ]
@@ -527,7 +573,7 @@ class GoogleSheetsService:
         row_already_exists = bool(target_row)
         if not target_row:
             target_row = self._last_used_row(rows, ROSTER_START_ROW) + 1
-            self._ensure_rows(service, ROSTER_SHEET_ID, target_row)
+            self._ensure_rows(service, self._sheet_id(service, ROSTER_SHEET), target_row)
 
         updates: list[dict[str, object]] = []
         # A brand-new row and an existing placeholder row located purely by candidate name both
@@ -567,7 +613,7 @@ class GoogleSheetsService:
         if str(profile.get("effective_date") or "") and (
             effective_new or is_new or reconcile_core or "effective_date" in changes
         ):
-            updates.append({"range": f"'{ROSTER_SHEET}'!AQ{target_row}", "values": [[str(profile.get('effective_date') or '')]]})
+            updates.append({"range": f"'{ROSTER_SHEET}'!{HIRE_DATE_COLUMN}{target_row}", "values": [[str(profile.get('effective_date') or '')]]})
         written_extra_fields: dict[str, str] = {}
         if extra_fields:
             for extra_key, extra_value in extra_fields.items():
@@ -580,6 +626,7 @@ class GoogleSheetsService:
                     EXTRA_ORG_COLUMNS.get(extra_key)
                     or EXTRA_SALARY_COLUMNS.get(extra_key)
                     or EXTRA_HR_DEFAULT_COLUMNS.get(extra_key)
+                    or EXTRA_IDENTITY_COLUMNS.get(extra_key)
                 )
                 if extra_key in NEW_HIRE_ONLY_EXTRA_KEYS and not effective_new:
                     current_row = rows[target_row - ROSTER_START_ROW] if target_row >= ROSTER_START_ROW and target_row - ROSTER_START_ROW < len(rows) else []
@@ -613,13 +660,13 @@ class GoogleSheetsService:
                 and target_row - ROSTER_START_ROW < len(rows)
                 else []
             )
-            grade_index = self._column_index("V")
+            grade_index = self._column_index(EXTRA_ORG_COLUMNS["job_grade"])
             current_grade = str(current_row[grade_index]).strip() if len(current_row) > grade_index else ""
             incoming_grade = str((extra_fields or {}).get("job_grade") or "").strip()
-            dropdown_exclusions = {"V"} if not (incoming_grade or current_grade) else set()
+            dropdown_exclusions = {EXTRA_ORG_COLUMNS["job_grade"]} if not (incoming_grade or current_grade) else set()
             self._copy_row_rules(
-                service, ROSTER_SHEET, ROSTER_SHEET_ID, source_row, target_row,
-                self._column_index("BJ") + 1,
+                service, ROSTER_SHEET, self._sheet_id(service, ROSTER_SHEET), source_row, target_row,
+                self._column_index(ROSTER_LAST_COLUMN) + 1,
                 dropdown_exclusions,
             )
             # Reconfirmed onboarding rows may already exist as HR placeholders.
@@ -656,22 +703,18 @@ class GoogleSheetsService:
 
             if onboarding_event and live_row:
                 for key, column in (
-                    ("employee_code", "B"),
-                    ("chinese_name", "C"),
-                    ("resume_name", "D"),
-                    ("effective_date", "F"),
+                    ("employee_code", ROSTER_COLUMNS["employee_code"]),
+                    ("chinese_name", ROSTER_COLUMNS["chinese_name"]),
+                    ("resume_name", ROSTER_COLUMNS["resume_name"]),
+                    ("effective_date", ROSTER_COLUMNS["effective_date"]),
                 ):
                     if not str(change_profile.get(key) or "").strip():
                         change_profile[key] = live_value(column)
-                for key, column in (
-                    ("org_unit", "L"),
-                    ("service_entity", "N"),
-                    ("department", "O"),
-                    ("position_title", "T"),
-                    ("job_level", "U"),
-                    ("job_grade", "V"),
+                for key in (
+                    "org_unit", "service_entity", "department",
+                    "position_title", "job_level", "job_grade",
                 ):
-                    change_extra_fields.setdefault(key, live_value(column))
+                    change_extra_fields.setdefault(key, live_value(EXTRA_ORG_COLUMNS[key]))
             self._append_change(
                 service, change_profile, changes, is_new or onboarding_event,
                 change_extra_fields,
@@ -749,7 +792,7 @@ class GoogleSheetsService:
                     break
         row = matched_row or self._last_used_row(rows, CHANGE_START_ROW) + 1
         if not matched_row:
-            self._ensure_rows(service, CHANGE_SHEET_ID, row)
+            self._ensure_rows(service, self._sheet_id(service, CHANGE_SHEET), row)
         sequence_values = [int(str(item[0])) for item in rows if item and str(item[0]).isdigit()]
         effective_date = str(profile.get("effective_date") or datetime.now().date().isoformat())
         details = "；".join(
@@ -780,7 +823,7 @@ class GoogleSheetsService:
         ]]
         if not matched_row:
             source_row = max(CHANGE_START_ROW, row - 1)
-            self._copy_row_rules(service, CHANGE_SHEET, CHANGE_SHEET_ID, source_row, row, 16)
+            self._copy_row_rules(service, CHANGE_SHEET, self._sheet_id(service, CHANGE_SHEET), source_row, row, 16)
         service.spreadsheets().values().update(
             spreadsheetId=self.spreadsheet_id,
             range=f"'{CHANGE_SHEET}'!A{row}:P{row}",
@@ -793,13 +836,14 @@ class GoogleSheetsService:
 
     def _clear_profile(self, profile: dict[str, object]) -> None:
         service = self._service()
-        rows = self._read_rows(service, ROSTER_SHEET, "A4:AF")
+        self._assert_roster_layout(service)
+        rows = self._read_rows(service, ROSTER_SHEET, "A4:AG")
         code = str(profile.get("employee_code") or "")
         target = next((ROSTER_START_ROW + i for i, row in enumerate(rows) if len(row) > 1 and str(row[1]).strip() == code), 0)
         if not target:
             return
         ranges = [f"'{ROSTER_SHEET}'!{column}{target}" for column in ROSTER_COLUMNS.values()]
-        ranges.append(f"'{ROSTER_SHEET}'!AQ{target}")
+        ranges.append(f"'{ROSTER_SHEET}'!{HIRE_DATE_COLUMN}{target}")
         service.spreadsheets().values().batchClear(
             spreadsheetId=self.spreadsheet_id, body={"ranges": ranges}
         ).execute()
@@ -811,7 +855,7 @@ class GoogleSheetsService:
 
     def _read_roster(self) -> list[dict[str, str]]:
         service = self._service()
-        rows = self._read_rows(service, ROSTER_SHEET, "A4:AF", self.roster_spreadsheet_id)
+        rows = self._read_rows(service, ROSTER_SHEET, "A4:AG", self.roster_spreadsheet_id)
         indices = {key: self._column_index(column) for key, column in ROSTER_COLUMNS.items()}
         roster: list[dict[str, str]] = []
         for row in rows:
@@ -842,7 +886,7 @@ class GoogleSheetsService:
 
     def _find_reference_org_fields(self, org_hint: str) -> dict[str, str]:
         service = self._service()
-        rows = self._read_rows(service, ROSTER_SHEET, "A4:AA")
+        rows = self._read_rows(service, ROSTER_SHEET, "A4:AB")
         indices = {key: self._column_index(column) for key, column in EXTRA_ORG_COLUMNS.items()}
         scored_matches: list[tuple[int, dict[str, str]]] = []
         for row in rows:

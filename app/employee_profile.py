@@ -142,6 +142,7 @@ EXTRA_FIELD_LABELS = {
     "试用期薪资": "trial_salary",
     "转正薪资": "confirmed_salary",
     "转正后薪资": "confirmed_salary",
+    "候选人编码": "candidate_code",
 }
 NORMALIZED_EXTRA_LABELS = {
     _normalize_label(key): value for key, value in EXTRA_FIELD_LABELS.items()
@@ -158,6 +159,13 @@ def _normalize_salary(value: str) -> str:
     elif match.group(2) == "万":
         amount *= 10000
     return str(int(amount))
+
+
+def normalize_candidate_code(value: str) -> str:
+    """候选人编码原样写入花名册 D 列，只去掉空白和全角字符差异，例如 HJHT0000126。"""
+    text = "".join(str(value or "").split())
+    text = text.translate({code: code - 0xFEE0 for code in range(0xFF01, 0xFF5F)})
+    return text.upper() if re.fullmatch(r"[A-Za-z]+\d+", text) else text
 
 
 def parse_extra_profile_fields(text: str) -> dict[str, str]:
@@ -178,6 +186,8 @@ def parse_extra_profile_fields(text: str) -> dict[str, str]:
                 values["job_level"] = level.group(1).upper()
                 if level.group(2):
                     values["job_grade"] = level.group(2)
+    if "candidate_code" in values:
+        values["candidate_code"] = normalize_candidate_code(values["candidate_code"])
     for salary_key in ("trial_salary", "confirmed_salary"):
         if salary_key in values:
             values[salary_key] = _normalize_salary(values[salary_key])
