@@ -161,6 +161,62 @@ class ChannelMessageSend(StatesGroup):
     waiting_for_confirmation = State()
 
 
+class SupervisorNotify(StatesGroup):
+    waiting_for_confirmation = State()
+
+
+def build_supervisor_groups(
+    hires: list[dict[str, str]],
+    supervisor_contacts: list[dict[str, str]],
+) -> tuple[dict[str, dict[str, object]], list[str]]:
+    """把今日入职新人按直接上级的工作TG分组。
+
+    返回 (groups, issues)：groups 以上级工作TG（小写、不带@）为键，值含
+    supervisor 花名、work_tg 和 hires 列表；issues 是无法通知的原因说明。
+    """
+    def key(value: object) -> str:
+        return "".join(str(value or "").split()).casefold()
+
+    contact_by_name = {key(item.get("requested_name")): item for item in supervisor_contacts}
+    groups: dict[str, dict[str, object]] = {}
+    issues: list[str] = []
+    for hire in hires:
+        supervisor = str(hire.get("supervisor") or "").strip().lstrip("@")
+        label = f"{hire['chinese_name']}（第 {hire['row']} 行）"
+        if not supervisor:
+            issues.append(f"{label}：AA 列直接上级为空")
+            continue
+        contact = contact_by_name.get(key(supervisor), {"status": "not_found"})
+        status = contact.get("status")
+        if status == "not_found":
+            issues.append(f"{label}：直接上级“{supervisor}”在花名册 C 列中找不到")
+            continue
+        if status == "missing_tg":
+            issues.append(f"{label}：直接上级“{supervisor}”的 AE 列工作TG为空")
+            continue
+        if status == "ambiguous":
+            issues.append(f"{label}：直接上级“{supervisor}”有多个同名行且 AE 列不一致，需人工核对")
+            continue
+        work_tg = str(contact.get("work_tg") or "")
+        group = groups.setdefault(work_tg.lstrip("@").casefold(), {
+            "supervisor": str(contact.get("chinese_name") or supervisor),
+            "work_tg": work_tg,
+            "hires": [],
+        })
+        group["hires"].append(hire)  # type: ignore[union-attr]
+    return groups, issues
+
+
+def supervisor_notice_text(supervisor: str, hires: list[dict[str, str]], today: str) -> str:
+    lines = [
+        "【今日入职新人通知】",
+        f"{supervisor}您好！以下新同事今天（{today}）入职，直接上级为您，请知悉并及时联系：",
+    ]
+    for index, hire in enumerate(hires, 1):
+        lines.append(f"{index}. {hire['chinese_name']}｜{hire.get('work_tg') or '工作TG待补充'}")
+    return "\n".join(lines)
+
+
 class TemplateCreate(StatesGroup):
     waiting_for_name = State()
     waiting_for_content = State()
@@ -733,6 +789,146 @@ def build_dispatcher(services: Services) -> Dispatcher:
                     InlineKeyboardButton(text="取消", callback_data="channelmsg:cancel"),
                 ]]),
             )
+
+    @router.message(Command("notify_supervisor"))
+    async def notify_supervisor_check(message: Message, state: FSMContext) -> None:
+        if not message.from_user or not _is_admin(message.from_user.id, services.settings):
+            await message.answer("无权使用此命令。")
+            return
+        if not services.sheets.configured:
+            await message.answer("Google 花名册尚未配置，无法查询。")
+            return
+        today = datetime.now(ATTENDANCE_TIMEZONE).date()
+        await message.answer(f"正在只读查询花名册 G 列生效日期为 {today.isoformat()} 的新人……")
+        try:
+            hires = await services.sheets.today_hires(today)
+            supervisor_names = sorted({
+                str(item.get("supervisor") or "").strip().lstrip("@")
+                for item in hires if str(item.get("supervisor") or "").strip()
+            })
+            contacts = (
+                await services.sheets.attendance_contacts(supervisor_names)
+                if supervisor_names else []
+            )
+        except Exception as exc:
+            logger.exception("Supervisor notification lookup failed")
+            await message.answer(f"花名册读取失败：{str(exc)[:160]}")
+            return
+        if not hires:
+            await message.answer(f"花名册中没有 G 列生效日期为 {today.isoformat()} 的新人。")
+            return
+        groups, issues = build_supervisor_groups(hires, contacts)
+        employees = await services.db.active_employees()
+        employee_by_username = {
+            employee.username.strip().lstrip("@").casefold(): employee
+            for employee in employees
+            if employee.username and employee.username.strip().lstrip("@")
+        }
+        sendable: dict[str, dict[str, object]] = {}
+        manual: list[dict[str, object]] = []
+        for username, group in groups.items():
+            group["text"] = supervisor_notice_text(
+                str(group["supervisor"]), list(group["hires"]), today.isoformat()  # type: ignore[arg-type]
+            )
+            employee = employee_by_username.get(username)
+            if employee:
+                sendable[str(employee.telegram_user_id)] = {**group, "chat_id": employee.chat_id}
+            else:
+                manual.append(group)
+
+        lines = [
+            "【今日入职新人 → 直接上级通知】",
+            f"今日（{today.isoformat()}）入职：{len(hires)} 人；涉及直接上级：{len(groups)} 人",
+        ]
+        if sendable:
+            lines.append("\n【可由机器人直接发送】")
+            for index, group in enumerate(sendable.values(), 1):
+                names = "、".join(str(h["chinese_name"]) for h in group["hires"])  # type: ignore[union-attr]
+                lines.append(f"{index}. {group['supervisor']}｜{group['work_tg']} ← {names}")
+        if manual:
+            lines.append("\n【上级未激活机器人｜请管理员人工转发】")
+            for index, group in enumerate(manual, 1):
+                username = str(group["work_tg"]).lstrip("@")
+                lines.append(f"{index}. {group['supervisor']}｜https://t.me/{username}\n{group['text']}")
+        if issues:
+            lines.append("\n【无法通知｜需人工处理】")
+            lines.extend(f"· {item}" for item in issues)
+        text = "\n".join(lines)
+        for start in range(0, len(text), 3700):
+            await message.answer(text[start:start + 3700])
+        if not sendable:
+            return
+        await state.clear()
+        await state.set_state(SupervisorNotify.waiting_for_confirmation)
+        await state.update_data(supervisor_notices=sendable)
+        sample = next(iter(sendable.values()))["text"]
+        await message.answer(
+            f"消息示例：\n\n{sample}\n\n确认向以上 {len(sendable)} 位直接上级发送吗？",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="确认发送", callback_data="supnotify:confirm"),
+                InlineKeyboardButton(text="取消", callback_data="supnotify:cancel"),
+            ]]),
+        )
+
+    @router.callback_query(F.data == "supnotify:cancel")
+    async def notify_supervisor_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+        if not callback.from_user or not _is_admin(callback.from_user.id, services.settings):
+            await callback.answer("无权操作", show_alert=True)
+            return
+        await state.clear()
+        await callback.answer("已取消")
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
+
+    @router.callback_query(SupervisorNotify.waiting_for_confirmation, F.data == "supnotify:confirm")
+    async def notify_supervisor_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+        if not callback.from_user or not _is_admin(callback.from_user.id, services.settings):
+            await callback.answer("无权操作", show_alert=True)
+            return
+        notices = dict((await state.get_data()).get("supervisor_notices") or {})
+        await state.clear()
+        await callback.answer("开始发送")
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        successful: list[str] = []
+        failed: list[str] = []
+        delay = 1 / services.settings.broadcast_messages_per_second
+        for user_id, notice in notices.items():
+            label = f"{notice['supervisor']} · {notice['work_tg']}"
+            chat_id = int(notice["chat_id"])
+            text = str(notice["text"])
+            for attempt in range(2):
+                try:
+                    await bot.send_message(chat_id, text)
+                    successful.append(label)
+                    try:
+                        await services.db.save_outbound_message(
+                            int(user_id), chat_id, text, message_kind="supervisor_notice",
+                        )
+                    except Exception:
+                        logger.exception("Failed to log supervisor notice for user %s", user_id)
+                    break
+                except TelegramRetryAfter as exc:
+                    if attempt:
+                        failed.append(label)
+                        break
+                    await asyncio.sleep(exc.retry_after + 0.5)
+                except (TelegramForbiddenError, TelegramBadRequest):
+                    await services.db.deactivate_employee(int(user_id))
+                    failed.append(f"{label}（对方可能已停用机器人，已标记为未激活）")
+                    break
+                except Exception:
+                    logger.exception("Supervisor notice send failed for user %s", user_id)
+                    failed.append(label)
+                    break
+            await asyncio.sleep(delay)
+        if callback.message:
+            lines = [f"直接上级通知发送完成。成功：{len(successful)}，失败：{len(failed)}"]
+            if successful:
+                lines.append("\n✅ 成功：\n" + "\n".join(successful))
+            if failed:
+                lines.append("\n❌ 失败：\n" + "\n".join(failed))
+            await callback.message.answer("\n".join(lines)[:3900])
 
     @router.callback_query(F.data == "channelmsg:cancel")
     async def channel_message_cancel(callback: CallbackQuery, state: FSMContext) -> None:
@@ -1672,6 +1868,7 @@ ADMIN_COMMANDS = [
     BotCommand(command="sync", description="管理员同步花名册(只读)"),
     BotCommand(command="roster", description="管理员查看本地花名册"),
     BotCommand(command="send_channel_msg", description="检查频道消息待处理名单"),
+    BotCommand(command="notify_supervisor", description="把今日入职新人发给其直接上级"),
 ]
 
 

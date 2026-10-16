@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import logging
 from collections import Counter
 from datetime import date, datetime
@@ -97,6 +98,18 @@ FORMULA_COLUMNS = ("X", "Y", "BC", "BF", "BH", "BK")
 HIRE_DATE_COLUMN = "AR"
 # 花名册最后一列（转正日期（含延期））。
 ROSTER_LAST_COLUMN = "BK"
+
+
+def parse_sheet_date(value: str) -> date | None:
+    """解析花名册里的日期文本：2026-10-16 / 2026/10/16 / 2026.10.16 / 2026年10月16日。"""
+    text = str(value or "").strip()
+    match = re.match(r"^(\d{4})\s*[-/.年]\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})", text)
+    if not match:
+        return None
+    try:
+        return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    except ValueError:
+        return None
 
 
 def onboarding_identity_keys(profile: dict[str, object]) -> set[str]:
@@ -339,6 +352,38 @@ class GoogleSheetsService:
                 "chinese_name": chinese_name,
                 "work_tg": f"@{username}" if username else "",
                 "hire_date": hire_date.isoformat(),
+            })
+        return results
+
+    async def today_hires(self, today: date) -> list[dict[str, str]]:
+        """Read-only: 表格一花名册中 G 列（生效日期）等于 today 的员工的 C 花名、AE 工作TG、AA 直接上级。"""
+        return await asyncio.to_thread(self._today_hires, today)
+
+    def _today_hires(self, today: date) -> list[dict[str, str]]:
+        service = self._service()
+        last = ROSTER_COLUMNS["work_tg"]
+        rows = self._read_rows(service, ROSTER_SHEET, f"A{ROSTER_START_ROW}:{last}5000")
+        name_index = self._column_index(ROSTER_COLUMNS["chinese_name"])
+        date_index = self._column_index(ROSTER_COLUMNS["effective_date"])
+        tg_index = self._column_index(ROSTER_COLUMNS["work_tg"])
+        supervisor_index = self._column_index(EXTRA_ORG_COLUMNS["direct_supervisor"])
+
+        def cell(row: list[object], index: int) -> str:
+            return str(row[index]).strip() if len(row) > index else ""
+
+        results: list[dict[str, str]] = []
+        for row_number, row in enumerate(rows, start=ROSTER_START_ROW):
+            if parse_sheet_date(cell(row, date_index)) != today:
+                continue
+            name = cell(row, name_index)
+            if not name:
+                continue
+            username = cell(row, tg_index).lstrip("@").strip()
+            results.append({
+                "row": str(row_number),
+                "chinese_name": name,
+                "work_tg": f"@{username}" if username else "",
+                "supervisor": cell(row, supervisor_index),
             })
         return results
 
