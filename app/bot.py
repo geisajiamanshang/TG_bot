@@ -537,6 +537,23 @@ async def _save_profile_values(
     return True
 
 
+def _vision_error_reason(exc: Exception) -> str:
+    """把截图识别（OpenAI）失败的原因翻译成管理员能处理的一句话。"""
+    text = str(exc)
+    lowered = text.casefold()
+    if "insufficient_quota" in lowered or "quota" in lowered:
+        return "OpenAI 账户额度不足或欠费，请充值或更换 OPENAI_API_KEY。"
+    if "invalid_api_key" in lowered or "incorrect api key" in lowered or "401" in lowered:
+        return "OPENAI_API_KEY 无效或已失效。"
+    if "rate limit" in lowered or "429" in lowered:
+        return "OpenAI 请求过于频繁，请稍等一分钟再发。"
+    if "model" in lowered and ("not found" in lowered or "does not exist" in lowered):
+        return "OPENAI_VISION_MODEL 配置的模型不可用。"
+    if "timeout" in lowered or "timed out" in lowered or "connection" in lowered:
+        return "连接 OpenAI 超时或网络不通，请稍后重试。"
+    return f"{exc.__class__.__name__}: {text[:200]}"
+
+
 def _sheet_error_reason(exc: Exception) -> str:
     """把 Google 表格写入失败的原因翻译成管理员能直接处理的一句话。"""
     text = str(exc)
@@ -1625,11 +1642,12 @@ def build_dispatcher(services: Services) -> Dispatcher:
         try:
             image, mime_type = await _download_message_image(message, bot)
             names = await services.vision.extract_attendance_names(image, mime_type)
-        except Exception:
+        except Exception as exc:
             logger.exception("Attendance screenshot processing failed for %s", message.from_user.id)
             await message.answer(
                 "截图识别失败，请重新发送这张截图；也可以直接发送花名文字兜底"
-                "（例如“张三 李四”或“张三，李四”）。考勤抽查仍在等待中。"
+                "（例如“张三 李四”或“张三，李四”）。考勤抽查仍在等待中。\n"
+                f"原因：{_vision_error_reason(exc)}"
             )
             return
         if not names:

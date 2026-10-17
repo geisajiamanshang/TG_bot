@@ -18,6 +18,25 @@ def clean_attendance_name(value: object) -> str:
     return re.split(r"\s*[\-‐‑‒–—―－]\s*", name, maxsplit=1)[0].strip()
 
 
+def parse_names_payload(text: str) -> list[str]:
+    """解析模型返回的 {"names": [...]}；JSON 不完整（被截断、带说明文字）时也尽量取出花名。"""
+    text = str(text or "").strip()
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        try:
+            payload = json.loads(match.group(0))
+            raw = payload.get("names") if isinstance(payload, dict) else None
+            if isinstance(raw, list):
+                return [str(item) for item in raw if str(item).strip()]
+        except (ValueError, TypeError):
+            pass
+    # 兜底：截断的 JSON（例如 {"names":["甲","乙","丙 ）只取 names 数组里已完整的字符串。
+    start = text.find("[")
+    if start < 0:
+        return []
+    return [item for item in re.findall(r'"((?:[^"\\]|\\.)*)"', text[start:]) if item.strip()]
+
+
 class VisionService:
     def __init__(self, settings: Settings) -> None:
         self.client = AsyncOpenAI(api_key=settings.openai_api_key, timeout=60.0)
@@ -122,16 +141,11 @@ class VisionService:
                     {"type": "input_image", "image_url": data_url, "detail": "high"},
                 ],
             }],
-            max_output_tokens=600,
+            # 名单截图可能有几十个人，600 token 会把 JSON 截断导致解析报错。
+            max_output_tokens=2000,
             store=False,
         )
-        match = re.search(r"\{.*\}", response.output_text.strip(), re.DOTALL)
-        if not match:
-            return []
-        payload = json.loads(match.group(0))
-        raw_names = payload.get("names")
-        if not isinstance(raw_names, list):
-            return []
+        raw_names = parse_names_payload(response.output_text or "")
         names: list[str] = []
         seen: set[str] = set()
         for item in raw_names:

@@ -20,3 +20,12 @@ class AttendanceNameCleaningTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ParseNamesPayloadTests(__import__("unittest").TestCase):
+    def test_complete_and_truncated_json(self):
+        from app.vision_service import parse_names_payload
+        self.assertEqual(parse_names_payload('{"names":["达刀","淼淼"]}'), ["达刀", "淼淼"])
+        self.assertEqual(parse_names_payload('```json\n{"names":["达刀","淼淼"]}\n```'), ["达刀", "淼淼"])
+        self.assertEqual(parse_names_payload('{"names":["达刀","淼淼","白砚'), ["达刀", "淼淼"])
+        self.assertEqual(parse_names_payload("没有识别到"), [])
