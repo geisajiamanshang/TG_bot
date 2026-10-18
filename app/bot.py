@@ -482,20 +482,23 @@ def build_probation_reminder(candidates: list[dict[str, str]]) -> str:
 PROBATION_DEFAULT_EVALUATION = "同意按期转正"
 
 
-async def _probation_resolve_form_link(services: "Services", candidate: dict[str, str]) -> str | None:
-    """按转正日期所在的年月，去 Drive "<年>-<月>月转正明细" 子文件夹里按花名找表单链接。"""
+async def _probation_resolve_form_link(services: "Services", candidate: dict[str, str]) -> str:
+    """按转正日期所在的年月，去 Drive "<年>-<月>月转正明细" 子文件夹里按花名找表单链接。
+    返回给预览/消息直接用的最终文案：真链接 / "待补充"（没找到）/
+    "待补充（Drive读取失败：...）"（读取报错，比如文件夹没共享给服务账号）。"""
     probation_date = parse_sheet_date(str(candidate.get("probation_date") or ""))
     chinese_name = str(candidate.get("chinese_name") or "").strip()
     if not probation_date or not chinese_name:
-        return None
+        return "待补充"
     try:
-        return await services.sheets.find_probation_form_link(
+        link = await services.sheets.find_probation_form_link(
             services.settings.probation_form_drive_folder_id,
             probation_date.year, probation_date.month, chinese_name,
         )
-    except Exception:
+        return link or "待补充"
+    except Exception as exc:
         logger.exception("Probation form link lookup failed for %s", chinese_name)
-        return None
+        return f"待补充（Drive读取失败：{str(exc)[:80]}）"
 
 
 def _build_probation_application_block(candidate: dict[str, str], form_link: str | None = None) -> str:

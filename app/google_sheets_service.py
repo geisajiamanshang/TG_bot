@@ -518,6 +518,7 @@ class GoogleSheetsService:
         query = f"'{folder_id}' in parents and trashed = false and name contains '{safe_name}'"
         response = drive.files().list(
             q=query, fields="files(id, name, mimeType)", pageSize=20,
+            supportsAllDrives=True, includeItemsFromAllDrives=True,
         ).execute()
         files = response.get("files", [])
         if not files:
@@ -525,7 +526,7 @@ class GoogleSheetsService:
         # 按花名精确匹配文件名（去掉扩展名）优先，否则取第一个包含花名的文件。
         exact = [f for f in files if Path(f["name"]).stem.strip() == chinese_name]
         chosen = exact[0] if exact else files[0]
-        content = drive.files().get_media(fileId=chosen["id"]).execute()
+        content = drive.files().get_media(fileId=chosen["id"], supportsAllDrives=True).execute()
         return content, chosen.get("mimeType", "application/octet-stream")
 
     async def find_probation_form_link(
@@ -550,6 +551,7 @@ class GoogleSheetsService:
         )
         folder_response = drive.files().list(
             q=folder_query, fields="files(id, name)", pageSize=50,
+            supportsAllDrives=True, includeItemsFromAllDrives=True,
         ).execute()
         month_folders = [
             f for f in folder_response.get("files", [])
@@ -562,6 +564,7 @@ class GoogleSheetsService:
         file_query = f"'{subfolder_id}' in parents and trashed = false and name contains '{safe_name}'"
         file_response = drive.files().list(
             q=file_query, fields="files(id, name, webViewLink)", pageSize=20,
+            supportsAllDrives=True, includeItemsFromAllDrives=True,
         ).execute()
         files = file_response.get("files", [])
         if not files:
