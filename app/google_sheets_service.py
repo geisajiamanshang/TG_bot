@@ -5,7 +5,7 @@ import json
 import re
 import logging
 from collections import Counter
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from threading import Lock
 
@@ -191,6 +191,15 @@ class GoogleSheetsService:
             scopes=["https://www.googleapis.com/auth/spreadsheets"],
         )
         return build("sheets", "v4", credentials=credentials, cache_discovery=False)
+
+    def _drive_service(self):
+        """只读 Drive 客户端，用于 /probation_notify 按花名在指定文件夹里找转正海报。
+        服务账号需要额外被授予该 Drive 文件夹的"查看者"权限。"""
+        credentials = Credentials.from_service_account_file(
+            self.credentials_file,
+            scopes=["https://www.googleapis.com/auth/drive.readonly"],
+        )
+        return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
     async def find_wallet_submission(self, profile: dict[str, object]) -> dict[str, str] | None:
         return await asyncio.to_thread(self._find_wallet_submission, profile)
@@ -407,6 +416,117 @@ class GoogleSheetsService:
                 record[key] = cell(row, index)
             results.append(record)
         return results
+
+    async def probation_notify_candidates(
+        self, today: date, advance_days: int = 4
+    ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+        """Read-only，供 /probation_notify 用：花名册 BK 列（转正日期，含延期）。
+        返回 (advance, due) 两个列表：advance 是 BK == today + advance_days 的员工
+        （提前 N 天预转正提醒），due 是 BK == today 的员工（转正当天）。"""
+        return await asyncio.to_thread(self._probation_notify_candidates, today, advance_days)
+
+    def _probation_notify_candidates(
+        self, today: date, advance_days: int
+    ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+        service = self._service()
+        last = ROSTER_LAST_COLUMN  # BK，覆盖到最后需要读取的列
+        rows = self._read_rows(service, ROSTER_SHEET, f"A{ROSTER_START_ROW}:{last}5000")
+
+        def idx(column: str) -> int:
+            return self._column_index(column)
+
+        fields = {
+            "employee_code": idx(ROSTER_COLUMNS["employee_code"]),       # B 编号
+            "chinese_name": idx(ROSTER_COLUMNS["chinese_name"]),         # C 花名
+            "resume_name": idx(ROSTER_COLUMNS["resume_name"]),           # E 简历名
+            "org_unit": idx(EXTRA_ORG_COLUMNS["org_unit"]),              # M 编制组织
+            "department": idx(EXTRA_ORG_COLUMNS["department"]),          # P 部门
+            "team": idx(EXTRA_ORG_COLUMNS["team"]),                      # Q 小组
+            "position_title": idx(EXTRA_ORG_COLUMNS["position_title"]),  # U 岗位
+            "job_level": idx(EXTRA_ORG_COLUMNS["job_level"]),            # V 职级
+            "direct_supervisor": idx(EXTRA_ORG_COLUMNS["direct_supervisor"]),  # AA 直属上级
+            "service_entity": idx(EXTRA_ORG_COLUMNS["service_entity"]),  # O 派驻公司
+            "work_tg": idx(ROSTER_COLUMNS["work_tg"]),                   # AE 工作TG
+            "hire_date": idx(HIRE_DATE_COLUMN),                          # AR 入职日期
+            "probation_date": idx(ROSTER_LAST_COLUMN),                   # BK 转正日期（含延期）
+        }
+
+        def cell(row: list[object], index: int) -> str:
+            return str(row[index]).strip() if len(row) > index else ""
+
+        name_index = fields["chinese_name"]
+        date_index = fields["probation_date"]
+        advance_target = today + timedelta(days=advance_days)
+
+        advance: list[dict[str, str]] = []
+        due: list[dict[str, str]] = []
+        for row_number, row in enumerate(rows, start=ROSTER_START_ROW):
+            name = cell(row, name_index)
+            if not name:
+                continue
+            probation_date = parse_sheet_date(cell(row, date_index))
+            if probation_date is None:
+                continue
+            record = {"row": str(row_number)}
+            for key, index in fields.items():
+                record[key] = cell(row, index)
+            if probation_date == advance_target:
+                advance.append(record)
+            elif probation_date == today:
+                due.append(record)
+        return advance, due
+
+    async def resolve_work_tg_by_name(self, name: str) -> str | None:
+        """按花名/简历名在整张花名册里找这个人自己的工作TG（AE列）。
+        用于"直接上级"只是个名字时，查出这位上级自己的工作TG 以便私信转发。"""
+        return await asyncio.to_thread(self._resolve_work_tg_by_name, name)
+
+    def _resolve_work_tg_by_name(self, name: str) -> str | None:
+        name = str(name or "").strip()
+        if not name:
+            return None
+        service = self._service()
+        last = ROSTER_COLUMNS["work_tg"]
+        rows = self._read_rows(service, ROSTER_SHEET, f"A{ROSTER_START_ROW}:{last}5000")
+        name_index = self._column_index(ROSTER_COLUMNS["chinese_name"])
+        resume_index = self._column_index(ROSTER_COLUMNS["resume_name"])
+        tg_index = self._column_index(ROSTER_COLUMNS["work_tg"])
+
+        def cell(row: list[object], index: int) -> str:
+            return str(row[index]).strip() if len(row) > index else ""
+
+        target = name.casefold()
+        for row in rows:
+            chinese_name = cell(row, name_index)
+            resume_name = cell(row, resume_index)
+            if target in (chinese_name.casefold(), resume_name.casefold()):
+                username = cell(row, tg_index).lstrip("@").strip()
+                return f"@{username}" if username else None
+        return None
+
+    async def find_probation_poster(self, folder_id: str, chinese_name: str) -> tuple[bytes, str] | None:
+        """在指定 Drive 文件夹里按花名找转正海报文件，返回 (文件内容, mime_type)。
+        服务账号必须已被共享该文件夹的查看权限，否则这里会抛出 HttpError。"""
+        return await asyncio.to_thread(self._find_probation_poster, folder_id, chinese_name)
+
+    def _find_probation_poster(self, folder_id: str, chinese_name: str) -> tuple[bytes, str] | None:
+        chinese_name = str(chinese_name or "").strip()
+        if not chinese_name or not folder_id:
+            return None
+        drive = self._drive_service()
+        safe_name = chinese_name.replace("'", "\\'")
+        query = f"'{folder_id}' in parents and trashed = false and name contains '{safe_name}'"
+        response = drive.files().list(
+            q=query, fields="files(id, name, mimeType)", pageSize=20,
+        ).execute()
+        files = response.get("files", [])
+        if not files:
+            return None
+        # 按花名精确匹配文件名（去掉扩展名）优先，否则取第一个包含花名的文件。
+        exact = [f for f in files if Path(f["name"]).stem.strip() == chinese_name]
+        chosen = exact[0] if exact else files[0]
+        content = drive.files().get_media(fileId=chosen["id"]).execute()
+        return content, chosen.get("mimeType", "application/octet-stream")
 
     def _today_hires(self, today: date) -> list[dict[str, str]]:
         service = self._service()

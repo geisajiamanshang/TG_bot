@@ -7,7 +7,7 @@ import logging
 import random
 import re
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
@@ -22,6 +22,7 @@ from aiogram.types import (
     BotCommand,
     BotCommandScopeChat,
     BotCommandScopeDefault,
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -168,6 +169,11 @@ class SupervisorNotify(StatesGroup):
 
 class OnboardingNotify(StatesGroup):
     waiting_for_confirmation = State()
+
+
+class ProbationNotify(StatesGroup):
+    # 1/2/2.1/3 可以按任意顺序、各自独立地回复，所以用同一个 state 一直等，直到 /cancel。
+    waiting_for_action = State()
 
 
 def build_supervisor_groups(
@@ -385,6 +391,250 @@ def build_onboarding_sync(candidates: list[dict[str, str]]) -> str:
     return f"【入职信息同步】\n\n{body}"
 
 
+# ---- /probation_notify：今日转正 -> 【新人预转正提醒】【转正申请】【转正通知】【转正信息同步】----
+# 规则来源：用户上传的模版文件（2026-10-18），不要凭记忆改动，以模版原文为准。
+# 注意：转正申请里的"直接上级"评语、"转正表单链接"花名册里没有对应字段，
+# 模版本身就是要发给员工/领导手填的空白表单，所以这两处用"待补充"占位，不是漏做。
+
+# (部门, 小组) 精确匹配优先于按部门匹配；值为 (hrbp handle, 领导 handle)。
+PROBATION_TEAM_LEADS: dict[tuple[str, str], tuple[str, str]] = {
+    ("ACFAN特战队", "内容组"): ("linerkang", "zlei1216"),
+    ("ACFAN特战队", "SEO组"): ("linerkang", "zlei1216"),
+    ("研发部", "前端组"): ("feang99568", "wdz999"),
+    ("研发部", "后端组"): ("feang99568", "liyuanba666"),
+}
+PROBATION_DEPARTMENT_LEADS: dict[str, tuple[str, str]] = {
+    "运营1部": ("FWN066", "zlei1216"),
+    "运营2部": ("wean4790", "xxs202215cz2025"),
+    "渠道拓展部": ("FWN066", "haohaoganhuoshaodapao"),
+    "传统销售部": ("FWN066", "haohaoganhuoshaodapao"),
+    "效能部": ("linerkang", "DaBai10010"),
+    "AIGC原创部": ("linerkang", "DaBai10010"),
+    # 其他未命中具体小组规则的 ACFAN特战队。
+    "ACFAN特战队": ("wean4790", "zlei1216"),
+}
+
+# 花名册 P 部门 -> 转正通知要发的全员群 chat_id。
+PROBATION_GROUP_CHAT_IDS: tuple[tuple[str, int], ...] = (
+    ("运营1部", -1003663263859),
+    ("运营2部", -1003950803307),
+    ("研发部", -1003946619557),
+    ("效能部", -1003946619557),
+    ("ACFAN特战队", -1003553653887),
+    ("AIGC原创部", -1003553653887),
+    ("传统销售部", -1003872014182),
+    ("渠道拓展部", -1003872014182),
+)
+
+# 直接上级是这些人时，/probation_notify 的"2.1"步骤不转发（这几位是公司高层，不需要走这个审批流程）。
+PROBATION_SUPERVISOR_SKIP_NAMES = frozenset({"辰泽", "张雷", "王大壮", "李元霸", "万丰", "白一舟"})
+
+
+def _probation_leads_for(department: str, team: str) -> tuple[str, str] | None:
+    department = department.strip()
+    team = team.strip()
+    for (team_dept, team_name), pair in PROBATION_TEAM_LEADS.items():
+        if _onboarding_department_matches(department, team_dept) and _onboarding_department_matches(team, team_name):
+            return pair
+    for dept_key, pair in PROBATION_DEPARTMENT_LEADS.items():
+        if _onboarding_department_matches(department, dept_key):
+            return pair
+    return None
+
+
+def _probation_group_chat_id(department: str) -> int | None:
+    for dept_key, chat_id in PROBATION_GROUP_CHAT_IDS:
+        if _onboarding_department_matches(department, dept_key):
+            return chat_id
+    return None
+
+
+def _build_probation_reminder_block(candidate: dict[str, str]) -> str:
+    department = str(candidate.get("department") or "").strip()
+    team = str(candidate.get("team") or "").strip()
+    leads = _probation_leads_for(department, team)
+    hrbp, leader = leads if leads else ("待确认HRBP", "待确认领导")
+    lines = [
+        f"【{candidate.get('org_unit') or ''}-恒睿公司-新人预转正提醒】",
+        "",
+        f"花名：{candidate.get('chinese_name') or ''}",
+        f"编号：{candidate.get('employee_code') or ''}",
+        f"岗位：{candidate.get('position_title') or ''}",
+        f"入职时间：{candidate.get('hire_date') or ''}",
+        f"按期转正日：{candidate.get('probation_date') or ''}",
+        "",
+        f"以上员工试用期即将届满，请@{hrbp} 向领导 @{leader} 做转正评估，确认是否按期转正；",
+    ]
+    return "\n".join(lines)
+
+
+def build_probation_reminder(candidates: list[dict[str, str]]) -> str:
+    """【新人预转正提醒】：每人一段（含自己的编制中心抬头），多人之间用 ——— 分隔，
+    结尾统一加一条延期/终止的说明（模版里这段只出现一次，不是每人重复）。"""
+    blocks = [_build_probation_reminder_block(candidate) for candidate in candidates]
+    body = "\n\n———\n\n".join(blocks)
+    return (
+        f"{body}\n\n"
+        "如需延期，请告知预计转正日期，另请ODC同步当事员工知晓；如需终止，请提前告知SSC安排离职事宜，谢谢！"
+    )
+
+
+def _build_probation_application_block(candidate: dict[str, str]) -> str:
+    """单人【试用员工转正申请】，私信发给员工本人/其直接上级时用的就是这一份。
+    "直接上级"评语和"转正表单链接"花名册里没有，留空白待手填。"""
+    department = str(candidate.get("department") or "").strip()
+    team = str(candidate.get("team") or "").strip()
+    leads = _probation_leads_for(department, team)
+    hrbp, leader = leads if leads else ("待确认HRBP", "待确认领导")
+    job_level = candidate.get("job_level") or "待补充"
+    lines = [
+        f"【{candidate.get('org_unit') or ''}-试用员工转正申请】",
+        "",
+        f"花名：{candidate.get('chinese_name') or ''}",
+        f"编号：{candidate.get('employee_code') or ''}",
+        f"组别：{department}-{team}",
+        f"岗位：{candidate.get('position_title') or ''}",
+        f"入职日期：{candidate.get('hire_date') or ''}",
+        f"转正日期：{candidate.get('probation_date') or ''}",
+        f"试用期职级：{job_level}",
+        f"转正职级：{job_level}",
+        "直接上级：待补充（请领导填写评语）",
+        "",
+        "转正表单链接：待补充",
+        "",
+        f"@{hrbp} 请odc填写【HRBP考核意见】，谢谢",
+        f"@{leader} 请领导在审批表【二级审批】中填写该员工转正意见，谢谢",
+    ]
+    return "\n".join(lines)
+
+
+def build_probation_notice_text(candidate: dict[str, str]) -> str:
+    """单个员工的【转正通知】正文（随海报一起发到对应全员群）。"""
+    work_tg = str(candidate.get("work_tg") or "").strip()
+    mention = f" @{work_tg.lstrip('@')}" if work_tg else ""
+    return (
+        "【转正通知】\n\n\n"
+        f"祝贺 {candidate.get('chinese_name') or ''}{mention}，表现优秀，通过试用期考核评估，"
+        f"于 {candidate.get('probation_date') or ''} 起正式转正。\n\n"
+        "愿你在未来的工作中继续保持热忱，持续成长，共创更多价值！\n\n"
+        "恭喜转正，未来可期！"
+    )
+
+
+def _build_probation_sync_block(candidate: dict[str, str]) -> str:
+    department = str(candidate.get("department") or "").strip()
+    team = str(candidate.get("team") or "").strip()
+    job_level = candidate.get("job_level") or "待补充"
+    return "\n".join([
+        f"北斗矩阵：{candidate.get('service_entity') or '恒睿'}",
+        f"部门-小组：{department}-{team}",
+        f"编号：{candidate.get('employee_code') or ''}",
+        f"花名：{candidate.get('chinese_name') or ''}",
+        f"岗位：{candidate.get('position_title') or ''}",
+        f"入职日期：{candidate.get('hire_date') or ''}",
+        f"转正日期：{candidate.get('probation_date') or ''}",
+        "直属上级/BP评估：待补充",
+        f"试用期职级：{job_level}",
+        f"转正职级：{job_level}",
+    ])
+
+
+def build_probation_sync(candidates: list[dict[str, str]]) -> str:
+    """【转正信息同步】：多人之间用 ——— 分隔，没有结尾备注行。"""
+    blocks = [_build_probation_sync_block(candidate) for candidate in candidates]
+    body = "\n\n———\n\n".join(blocks)
+    return f"【转正信息同步】\n\n{body}"
+
+
+async def run_probation_notify(bot: Bot, chat_id: int, state: FSMContext, services: "Services") -> None:
+    """查花名册 BK 列生成 /probation_notify 预览并写入 FSM state。供手动命令和
+    周一到周六 10:00 的定时任务共用（定时任务没有 Message，所以不依赖它）。"""
+    if not services.sheets.configured:
+        await bot.send_message(chat_id, "Google 花名册尚未配置，无法查询。")
+        return
+    settings = services.settings
+    if not settings.probation_union_group_chat_id or not settings.probation_sync_group_chat_id:
+        await bot.send_message(
+            chat_id,
+            "尚未配置 PROBATION_UNION_GROUP_CHAT_ID / PROBATION_SYNC_GROUP_CHAT_ID，"
+            "请先在 .env 里配置这两个群的 chat_id 后再使用本命令。",
+        )
+        return
+    today = datetime.now(ATTENDANCE_TIMEZONE).date()
+    try:
+        advance, due = await services.sheets.probation_notify_candidates(today, advance_days=4)
+    except Exception as exc:
+        logger.exception("Probation notify lookup failed")
+        await bot.send_message(chat_id, f"花名册读取失败：{str(exc)[:160]}")
+        return
+    if not advance and not due:
+        await bot.send_message(chat_id, f"今天（{today.isoformat()}）花名册 BK 列里没有需要处理的转正提醒/转正。")
+        return
+
+    reminder_text = build_probation_reminder(advance) if advance else ""
+    sync_text = build_probation_sync(due) if due else ""
+
+    await state.clear()
+    await state.set_state(ProbationNotify.waiting_for_action)
+    await state.update_data(
+        probation_advance=advance,
+        probation_due=due,
+        probation_reminder_text=reminder_text,
+        probation_sync_text=sync_text,
+        probation_done={},
+    )
+
+    parts = [f"今天（{today.isoformat()}）："]
+    if advance:
+        adv_names = "、".join(str(c.get("chinese_name") or "") for c in advance)
+        parts.append(
+            f"距转正还有4天的有 {len(advance)} 人：{adv_names}\n\n"
+            f"———【新人预转正提醒】预览（回复 1 转发到恒睿公司-联合管理群）———\n\n{reminder_text}\n\n"
+            "———【转正申请】预览（每人一份，回复 2 私信发给本人工作TG；回复 2.1 私信发给其直接上级）———\n\n"
+            + "\n\n———\n\n".join(_build_probation_application_block(c) for c in advance)
+        )
+    if due:
+        due_names = "、".join(str(c.get("chinese_name") or "") for c in due)
+        parts.append(
+            f"今天就是转正日的有 {len(due)} 人：{due_names}\n\n"
+            "———【转正通知】预览（回复 3，逐人连同转正海报发到其部门对应的全员群；"
+            "随后【转正信息同步】会在当天 16:45-19:00 之间随机发到人事数据同步-SSC3组）———\n\n"
+            + "\n\n———\n\n".join(build_probation_notice_text(c) for c in due)
+        )
+    parts.append("完成需要的步骤后回复 /cancel 结束本轮；全部步骤做完会自动清理。")
+    preview = "\n\n".join(parts)
+
+    preview_message_ids: list[int] = []
+    for start in range(0, len(preview), 3700):
+        sent = await bot.send_message(chat_id, preview[start:start + 3700])
+        preview_message_ids.append(sent.message_id)
+    await state.update_data(probation_preview_message_ids=preview_message_ids)
+
+
+async def probation_notify_scheduler_loop(bot: Bot, dp: Dispatcher, services: "Services") -> None:
+    """周一到周六（Asia/Shanghai）10:00 之后，每天自动给每个管理员各发一次
+    /probation_notify 预览（和手动执行命令效果一样，仍然要回复 1/2/2.1/3 才会真正发送）。"""
+    last_run_date: date | None = None
+    while True:
+        try:
+            now_local = datetime.now(ATTENDANCE_TIMEZONE)
+            # Python weekday(): 周一=0 ... 周六=5，周日=6（周日不跑）。
+            if now_local.weekday() <= 5 and now_local.hour >= 10 and last_run_date != now_local.date():
+                last_run_date = now_local.date()
+                for admin_id in services.settings.admin_user_ids:
+                    try:
+                        admin_state = dp.fsm.resolve_context(bot, chat_id=admin_id, user_id=admin_id)
+                        await bot.send_message(admin_id, "【每日定时】正在查今天的转正提醒/转正……")
+                        await run_probation_notify(bot, admin_id, admin_state, services)
+                    except Exception:
+                        logger.exception("Scheduled probation notify failed for admin %s", admin_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Probation notify scheduler loop failed")
+        await asyncio.sleep(300)
+
+
 class TemplateCreate(StatesGroup):
     waiting_for_name = State()
     waiting_for_content = State()
@@ -400,6 +650,8 @@ class Services:
     gpt: GPTService
     # /onboarding_notify：管理员 user_id -> 下午待发"入职信息同步"的后台任务，/cancel 时用来撤销。
     onboarding_sync_tasks: dict[int, asyncio.Task] = field(default_factory=dict)
+    # /probation_notify：管理员 user_id -> 下午待发"转正信息同步"的后台任务，/cancel 时用来撤销。
+    probation_sync_tasks: dict[int, asyncio.Task] = field(default_factory=dict)
 
 
 def _is_admin(user_id: int, settings: Settings) -> bool:
@@ -813,6 +1065,10 @@ def build_dispatcher(services: Services) -> Dispatcher:
             task = services.onboarding_sync_tasks.pop(message.from_user.id, None)
             if task and not task.done():
                 task.cancel()
+            # /probation_notify 下午待发送的【转正信息同步】后台任务也一并撤销。
+            probation_task = services.probation_sync_tasks.pop(message.from_user.id, None)
+            if probation_task and not probation_task.done():
+                probation_task.cancel()
         await message.answer("操作已取消。")
 
     @router.message(Command("stats"))
@@ -1245,6 +1501,202 @@ def build_dispatcher(services: Services) -> Dispatcher:
         if existing and not existing.done():
             existing.cancel()
         services.onboarding_sync_tasks[admin_id] = asyncio.create_task(_send_sync_later())
+
+    @router.message(Command("probation_notify"))
+    async def probation_notify_start(message: Message, state: FSMContext, bot: Bot) -> None:
+        if not message.from_user or not _is_admin(message.from_user.id, services.settings):
+            await message.answer("无权使用此命令。")
+            return
+        await message.answer("正在只读查询花名册 BK 列（转正日期）……")
+        await run_probation_notify(bot, message.chat.id, state, services)
+
+    async def _probation_mark_done_and_maybe_cleanup(
+        state: FSMContext, bot: Bot, chat_id: int, action: str
+    ) -> None:
+        data = await state.get_data()
+        done = dict(data.get("probation_done") or {})
+        done[action] = True
+        await state.update_data(probation_done=done)
+        advance = data.get("probation_advance") or []
+        due = data.get("probation_due") or []
+        required = set()
+        if advance:
+            required |= {"1", "2", "2.1"}
+        if due:
+            required.add("3")
+        if required and required.issubset(set(k for k, v in done.items() if v)):
+            preview_message_ids = [int(v) for v in data.get("probation_preview_message_ids") or []]
+            for message_id in preview_message_ids:
+                try:
+                    await bot.delete_message(chat_id, message_id)
+                except Exception:
+                    logger.exception("Failed to delete probation preview message %s", message_id)
+            await state.clear()
+
+    @router.message(ProbationNotify.waiting_for_action, F.text)
+    async def probation_notify_action(message: Message, state: FSMContext, bot: Bot) -> None:
+        if not message.from_user or not _is_admin(message.from_user.id, services.settings):
+            await state.clear()
+            return
+        text = (message.text or "").strip()
+        if text.casefold().startswith("/cancel"):
+            return  # 交给全局 /cancel 命令处理
+        if text not in {"1", "2", "2.1", "3"}:
+            await message.answer("回复 1 / 2 / 2.1 / 3 执行对应步骤；或回复 /cancel 取消本轮。")
+            return
+
+        data = await state.get_data()
+        advance: list[dict[str, str]] = data.get("probation_advance") or []
+        due: list[dict[str, str]] = data.get("probation_due") or []
+        reminder_text = str(data.get("probation_reminder_text") or "")
+        sync_text = str(data.get("probation_sync_text") or "")
+        admin_id = message.from_user.id
+        chat_id = message.chat.id
+        settings = services.settings
+
+        if text == "1":
+            if not advance or not reminder_text:
+                await message.answer("没有需要发送的【新人预转正提醒】。")
+                return
+            try:
+                await bot.send_message(settings.probation_union_group_chat_id, reminder_text)
+            except Exception as exc:
+                logger.exception("Probation reminder send failed")
+                await message.answer(f"发送【新人预转正提醒】到群失败：{str(exc)[:160]}")
+                return
+            await message.answer("✅ 【新人预转正提醒】已发送到恒睿公司-联合管理群。")
+            await _probation_mark_done_and_maybe_cleanup(state, bot, chat_id, "1")
+            return
+
+        if text in {"2", "2.1"}:
+            if not advance:
+                await message.answer("没有需要处理的【转正申请】。")
+                return
+            successful: list[str] = []
+            failed: list[str] = []
+            skipped: list[str] = []
+            for candidate in advance:
+                name = str(candidate.get("chinese_name") or "")
+                block = _build_probation_application_block(candidate)
+                if text == "2":
+                    target_tg = str(candidate.get("work_tg") or "").strip().lstrip("@")
+                    if not target_tg:
+                        failed.append(f"{name}（花名册 AE 列没有工作TG）")
+                        continue
+                    caption = "填写个人部分并签字，请写详细一些"
+                else:
+                    supervisor_name = str(candidate.get("direct_supervisor") or "").strip()
+                    if not supervisor_name:
+                        failed.append(f"{name}（花名册 AA 列没有直接上级）")
+                        continue
+                    if supervisor_name in PROBATION_SUPERVISOR_SKIP_NAMES:
+                        skipped.append(f"{name}（直接上级 {supervisor_name} 无需走此流程）")
+                        continue
+                    supervisor_tg = await services.sheets.resolve_work_tg_by_name(supervisor_name)
+                    if not supervisor_tg:
+                        failed.append(f"{name}（花名册里找不到直接上级「{supervisor_name}」自己的工作TG）")
+                        continue
+                    target_tg = supervisor_tg.lstrip("@")
+                    caption = "请领导审批"
+                try:
+                    target_chat = await bot.get_chat(f"@{target_tg}")
+                    await bot.send_message(target_chat.id, f"{block}\n\n{caption}")
+                    successful.append(name)
+                except Exception as exc:
+                    logger.exception("Probation application send failed for %s", name)
+                    failed.append(f"{name}（@{target_tg}，{str(exc)[:80]}）")
+            lines = [f"步骤 {text} 完成。成功：{len(successful)}，跳过：{len(skipped)}，失败：{len(failed)}"]
+            if successful:
+                lines.append("✅ " + "、".join(successful))
+            if skipped:
+                lines.append("⏭️ " + "、".join(skipped))
+            if failed:
+                lines.append("❌ " + "\n".join(failed))
+            await message.answer("\n".join(lines)[:3900])
+            await _probation_mark_done_and_maybe_cleanup(state, bot, chat_id, text)
+            return
+
+        # text == "3"
+        if not due:
+            await message.answer("没有今天就转正的员工。")
+            return
+        successful = []
+        failed = []
+        for candidate in due:
+            name = str(candidate.get("chinese_name") or "")
+            department = str(candidate.get("department") or "")
+            target_chat_id = _probation_group_chat_id(department)
+            if target_chat_id is None:
+                failed.append(f"{name}（部门「{department}」没有对应的全员群映射）")
+                continue
+            notice_text = build_probation_notice_text(candidate)
+            try:
+                poster = await services.sheets.find_probation_poster(
+                    settings.probation_poster_drive_folder_id, name
+                )
+            except Exception:
+                logger.exception("Probation poster lookup failed for %s", name)
+                poster = None
+            try:
+                if poster:
+                    content, _mime = poster
+                    await bot.send_photo(
+                        target_chat_id,
+                        BufferedInputFile(content, filename=f"{name}.jpg"),
+                        caption=notice_text,
+                    )
+                else:
+                    await bot.send_message(target_chat_id, notice_text)
+                successful.append(name)
+            except Exception as exc:
+                logger.exception("Probation notice send failed for %s", name)
+                failed.append(f"{name}（{str(exc)[:80]}）")
+        lines = [f"【转正通知】发送完成。成功：{len(successful)}，失败：{len(failed)}"]
+        if successful:
+            lines.append("✅ " + "、".join(successful))
+        if failed:
+            lines.append("❌ " + "\n".join(failed))
+        await message.answer("\n".join(lines)[:3900])
+
+        if not sync_text:
+            await _probation_mark_done_and_maybe_cleanup(state, bot, chat_id, "3")
+            return
+
+        sync_chat_id = settings.probation_sync_group_chat_id
+        now = datetime.now(ATTENDANCE_TIMEZONE)
+        window_start = now.replace(hour=16, minute=45, second=0, microsecond=0)
+        window_end = now.replace(hour=19, minute=0, second=0, microsecond=0)
+        if now >= window_end:
+            target = now + timedelta(seconds=5)
+            await message.answer("现在已经过了 16:45-19:00 这个时间段，【转正信息同步】将在几秒后直接发送。")
+        else:
+            start_from = max(now, window_start)
+            span_seconds = max(0, int((window_end - start_from).total_seconds()))
+            target = start_from + timedelta(seconds=random.randint(0, span_seconds))
+            await message.answer(f"已安排今天 {target.strftime('%H:%M')} 左右发送【转正信息同步】到人事数据同步-SSC3组。")
+
+        async def _send_probation_sync_later() -> None:
+            try:
+                delay = max(0.0, (target - datetime.now(ATTENDANCE_TIMEZONE)).total_seconds())
+                await asyncio.sleep(delay)
+                await bot.send_message(sync_chat_id, sync_text)
+                await bot.send_message(chat_id, "✅ 【转正信息同步】已发送到人事数据同步-SSC3组。")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Probation sync send failed")
+                try:
+                    await bot.send_message(chat_id, "发送【转正信息同步】到群失败，请人工处理。")
+                except Exception:
+                    logger.exception("Failed to notify admin about probation sync failure")
+            finally:
+                services.probation_sync_tasks.pop(admin_id, None)
+                await _probation_mark_done_and_maybe_cleanup(state, bot, chat_id, "3")
+
+        existing = services.probation_sync_tasks.pop(admin_id, None)
+        if existing and not existing.done():
+            existing.cancel()
+        services.probation_sync_tasks[admin_id] = asyncio.create_task(_send_probation_sync_later())
 
     @router.callback_query(F.data == "channelmsg:cancel")
     async def channel_message_cancel(callback: CallbackQuery, state: FSMContext) -> None:
@@ -2187,6 +2639,7 @@ ADMIN_COMMANDS = [
     BotCommand(command="send_channel_msg", description="检查频道消息待处理名单"),
     BotCommand(command="notify_supervisor", description="把今日入职新人发给其直接上级"),
     BotCommand(command="onboarding_notify", description="今日入职通知转发到群"),
+    BotCommand(command="probation_notify", description="今日转正提醒/转正通知转发到群"),
 ]
 
 

@@ -27,6 +27,13 @@ class Settings(BaseSettings):
     # 机器人必须已经是这两个群的成员才能发消息；群 chat_id 通常是负数。
     onboarding_notify_group_chat_id: int | None = None
     onboarding_sync_group_chat_id: int | None = None
+    # /probation_notify 用：恒睿公司-联合管理群（预转正提醒，和上面的 onboarding_notify_group_chat_id
+    # 是同一个群，这里保留一个独立字段方便以后拆开配置）、人事数据同步-SSC3组（转正信息同步，注意这是
+    # 另一个和上面 onboarding_sync_group_chat_id 不同的群）。
+    probation_union_group_chat_id: int | None = None
+    probation_sync_group_chat_id: int | None = None
+    # 转正海报所在的 Google Drive 文件夹 ID（服务账号必须被额外共享该文件夹的查看权限）。
+    probation_poster_drive_folder_id: str = "1ow3D3vRgUSQ6PctbcoAmbdNkjzh3kF83"
 
     @field_validator("admin_user_ids", mode="before")
     @classmethod
