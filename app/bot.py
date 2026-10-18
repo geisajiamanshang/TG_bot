@@ -225,18 +225,24 @@ def supervisor_notice_text(supervisor: str, hires: list[dict[str, str]], today: 
 # ---- /onboarding_notify：今日入职 -> 【新人入职通知】【入职信息同步】两个群通知的生成规则 ----
 # 规则来源：用户上传的模版文件（2026-10-17），不要凭记忆改动，以模版原文为准。
 
-ONBOARDING_BASE_MENTIONS: tuple[str, ...] = ("DaBai10010", "wean4790")
+# 备注行 @ 顺序固定为：最先 DaBai10010 -> 直接/间接上级级别的人 -> HRBP -> 最后 wean4790。
+ONBOARDING_MENTION_FIRST: tuple[str, ...] = ("DaBai10010",)
+ONBOARDING_MENTION_LAST: tuple[str, ...] = ("wean4790",)
+ONBOARDING_SUPERVISOR_HANDLES = frozenset(
+    {"zlei1216", "xxs202215cz2025", "liyuanba666", "wdz999", "haohaoganhuoshaodapao"}
+)
+ONBOARDING_HRBP_HANDLES = frozenset({"FWN066", "feang99568", "kcin895"})
 
 # (部门, 小组) 精确匹配优先于按部门匹配。
 ONBOARDING_TEAM_MENTIONS: dict[tuple[str, str], tuple[str, ...]] = {
-    ("ACFAN特战队", "内容组"): ("linerkang", "wean4790"),
-    ("ACFAN特战队", "SEO组"): ("linerkang", "wean4790"),
+    ("ACFAN特战队", "内容组"): ("haohaoganhuoshaodapao", "wean4790"),
+    ("ACFAN特战队", "SEO组"): ("haohaoganhuoshaodapao", "wean4790"),
     ("研发部", "前端组"): ("wdz999", "feang99568", "kcin895"),
     ("研发部", "后端组"): ("liyuanba666", "feang99568", "kcin895"),
 }
 ONBOARDING_DEPARTMENT_MENTIONS: dict[str, tuple[str, ...]] = {
-    "效能部": ("linerkang", "wean4790"),
-    "AIGC原创部": ("linerkang", "wean4790"),
+    "效能部": ("haohaoganhuoshaodapao", "wean4790"),
+    "AIGC原创部": ("haohaoganhuoshaodapao", "wean4790"),
     "运营一部": ("FWN066", "zlei1216"),
     "运营二部": ("xxs202215cz2025", "wean4790"),
     # 其他未命中具体小组规则的 ACFAN特战队。
@@ -280,24 +286,37 @@ def _onboarding_has_work_contact_fields(department: str) -> bool:
 
 
 def _onboarding_all_mentions(candidates: list[dict[str, str]]) -> list[str]:
-    """所有候选人适用规则的并集去重（含固定的 base mentions），保留首次出现的顺序。"""
-    ordered: list[str] = []
-    seen: set[str] = set()
+    """所有候选人适用规则的并集去重，按固定顺序排列：
+    最先 DaBai10010 -> 直接/间接上级级别的人 -> 其他未分类的人 -> HRBP -> 最后 wean4790。"""
+    seen: set[str] = set(ONBOARDING_MENTION_FIRST) | set(ONBOARDING_MENTION_LAST)
+    supervisor_tier: list[str] = []
+    hrbp_tier: list[str] = []
+    other_tier: list[str] = []
 
-    def add(handle: str) -> None:
+    def classify(handle: str) -> None:
         handle = handle.strip()
-        if handle and handle not in seen:
-            seen.add(handle)
-            ordered.append(handle)
+        if not handle or handle in seen:
+            return
+        seen.add(handle)
+        if handle in ONBOARDING_SUPERVISOR_HANDLES:
+            supervisor_tier.append(handle)
+        elif handle in ONBOARDING_HRBP_HANDLES:
+            hrbp_tier.append(handle)
+        else:
+            other_tier.append(handle)
 
-    for handle in ONBOARDING_BASE_MENTIONS:
-        add(handle)
     for candidate in candidates:
         for handle in _onboarding_mentions_for(
             str(candidate.get("department") or ""), str(candidate.get("team") or "")
         ):
-            add(handle)
-    return ordered
+            classify(handle)
+    return [
+        *ONBOARDING_MENTION_FIRST,
+        *supervisor_tier,
+        *other_tier,
+        *hrbp_tier,
+        *ONBOARDING_MENTION_LAST,
+    ]
 
 
 def _build_onboarding_notice_block(candidate: dict[str, str]) -> str:
