@@ -40,7 +40,7 @@ from app.employee_profile import (
     profile_text,
     validate_profile,
 )
-from app.google_sheets_service import GoogleSheetsService
+from app.google_sheets_service import GoogleSheetsService, parse_sheet_date
 from app.gpt_service import GPTService
 from app.vision_service import VisionService
 from app import hr_defaults
@@ -479,9 +479,29 @@ def build_probation_reminder(candidates: list[dict[str, str]]) -> str:
     )
 
 
-def _build_probation_application_block(candidate: dict[str, str]) -> str:
+PROBATION_DEFAULT_EVALUATION = "同意按期转正"
+
+
+async def _probation_resolve_form_link(services: "Services", candidate: dict[str, str]) -> str | None:
+    """按转正日期所在的年月，去 Drive "<年>-<月>月转正明细" 子文件夹里按花名找表单链接。"""
+    probation_date = parse_sheet_date(str(candidate.get("probation_date") or ""))
+    chinese_name = str(candidate.get("chinese_name") or "").strip()
+    if not probation_date or not chinese_name:
+        return None
+    try:
+        return await services.sheets.find_probation_form_link(
+            services.settings.probation_form_drive_folder_id,
+            probation_date.year, probation_date.month, chinese_name,
+        )
+    except Exception:
+        logger.exception("Probation form link lookup failed for %s", chinese_name)
+        return None
+
+
+def _build_probation_application_block(candidate: dict[str, str], form_link: str | None = None) -> str:
     """单人【试用员工转正申请】，私信发给员工本人/其直接上级时用的就是这一份。
-    "直接上级"评语和"转正表单链接"花名册里没有，留空白待手填。"""
+    "直接上级"评语默认写"同意按期转正"；"转正表单链接"按转正日期年月去 Drive 对应
+    的"<年>-<月>月转正明细"子文件夹里按花名查找，找不到就留"待补充"。"""
     department = str(candidate.get("department") or "").strip()
     team = str(candidate.get("team") or "").strip()
     leads = _probation_leads_for(department, team)
@@ -498,12 +518,12 @@ def _build_probation_application_block(candidate: dict[str, str]) -> str:
         f"转正日期：{candidate.get('probation_date') or ''}",
         f"试用期职级：{job_level}",
         f"转正职级：{job_level}",
-        "直接上级：待补充（请领导填写评语）",
+        f"直接上级：{PROBATION_DEFAULT_EVALUATION}",
         "",
-        "转正表单链接：待补充",
+        f"转正表单链接：{form_link or '待补充'}",
         "",
-        f"@{hrbp} 请odc填写【HRBP考核意见】，谢谢",
-        f"@{leader} 请领导在审批表【二级审批】中填写该员工转正意见，谢谢",
+        f"@{hrbp} 请odc填写HRBP考核意见，谢谢",
+        f"@{leader} 请领导在审批表二级审批中填写该员工转正意见，谢谢",
     ]
     return "\n".join(lines)
 
@@ -587,11 +607,16 @@ async def run_probation_notify(bot: Bot, chat_id: int, state: FSMContext, servic
     parts = [f"今天（{today.isoformat()}）："]
     if advance:
         adv_names = "、".join(str(c.get("chinese_name") or "") for c in advance)
+        application_blocks = []
+        for c in advance:
+            form_link = await _probation_resolve_form_link(services, c)
+            application_blocks.append(_build_probation_application_block(c, form_link))
         parts.append(
             f"距转正还有4天的有 {len(advance)} 人：{adv_names}\n\n"
             f"———【新人预转正提醒】预览（回复 1 转发到恒睿公司-联合管理群）———\n\n{reminder_text}\n\n"
-            "———【转正申请】预览（每人一份，回复 2 私信发给本人工作TG；回复 2.1 私信发给其直接上级）———\n\n"
-            + "\n\n———\n\n".join(_build_probation_application_block(c) for c in advance)
+            "———【转正申请】预览（每人一份，回复 2 私信发给本人工作TG；回复 2.1 私信发给其直接上级；"
+            "回复 2.2 把所有人的转正申请一起发到恒睿公司-联合管理群）———\n\n"
+            + "\n\n———\n\n".join(application_blocks)
         )
     if due:
         due_names = "、".join(str(c.get("chinese_name") or "") for c in due)
@@ -1541,8 +1566,8 @@ def build_dispatcher(services: Services) -> Dispatcher:
         text = (message.text or "").strip()
         if text.casefold().startswith("/cancel"):
             return  # 交给全局 /cancel 命令处理
-        if text not in {"1", "2", "2.1", "3"}:
-            await message.answer("回复 1 / 2 / 2.1 / 3 执行对应步骤；或回复 /cancel 取消本轮。")
+        if text not in {"1", "2", "2.1", "2.2", "3"}:
+            await message.answer("回复 1 / 2 / 2.1 / 2.2 / 3 执行对应步骤；或回复 /cancel 取消本轮。")
             return
 
         data = await state.get_data()
@@ -1568,6 +1593,28 @@ def build_dispatcher(services: Services) -> Dispatcher:
             await _probation_mark_done_and_maybe_cleanup(state, bot, chat_id, "1")
             return
 
+        if text == "2.2":
+            if not advance:
+                await message.answer("没有需要发送的【试用期转正申请】。")
+                return
+            blocks = []
+            for candidate in advance:
+                form_link = await _probation_resolve_form_link(services, candidate)
+                blocks.append(_build_probation_application_block(candidate, form_link))
+            application_text = "\n\n———\n\n".join(blocks)
+            try:
+                for start in range(0, len(application_text), 3900):
+                    await bot.send_message(
+                        settings.probation_union_group_chat_id, application_text[start:start + 3900]
+                    )
+            except Exception as exc:
+                logger.exception("Probation application group send failed")
+                await message.answer(f"发送【试用期转正申请】到群失败：{str(exc)[:160]}")
+                return
+            await message.answer("✅ 【试用期转正申请】已发送到恒睿公司-联合管理群。")
+            await _probation_mark_done_and_maybe_cleanup(state, bot, chat_id, "2.2")
+            return
+
         if text in {"2", "2.1"}:
             if not advance:
                 await message.answer("没有需要处理的【转正申请】。")
@@ -1577,7 +1624,8 @@ def build_dispatcher(services: Services) -> Dispatcher:
             skipped: list[str] = []
             for candidate in advance:
                 name = str(candidate.get("chinese_name") or "")
-                block = _build_probation_application_block(candidate)
+                form_link = await _probation_resolve_form_link(services, candidate)
+                block = _build_probation_application_block(candidate, form_link)
                 if text == "2":
                     target_tg = str(candidate.get("work_tg") or "").strip().lstrip("@")
                     if not target_tg:
@@ -1622,7 +1670,10 @@ def build_dispatcher(services: Services) -> Dispatcher:
             return
         successful = []
         failed = []
-        for candidate in due:
+        for index, candidate in enumerate(due):
+            if index > 0:
+                # 多人连续发转正海报到全员群时，每次发送间随机间隔 30 秒 - 1 分钟。
+                await asyncio.sleep(random.uniform(30, 60))
             name = str(candidate.get("chinese_name") or "")
             department = str(candidate.get("department") or "")
             target_chat_id = _probation_group_chat_id(department)

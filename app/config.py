@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     probation_sync_group_chat_id: int | None = None
     # 转正海报所在的 Google Drive 文件夹 ID（服务账号必须被额外共享该文件夹的查看权限）。
     probation_poster_drive_folder_id: str = "1ow3D3vRgUSQ6PctbcoAmbdNkjzh3kF83"
+    # 转正表单链接所在的 Google Drive 根文件夹 ID（"2-试用期管理"，下面按"<年>-<月>月转正明细"
+    # 这样的子文件夹分月存放，服务账号也要被额外共享这个文件夹的查看权限）。
+    probation_form_drive_folder_id: str = "17mscwGo9mdwQg59AJRkIwSxM-M_Sgchz"
 
     @field_validator("admin_user_ids", mode="before")
     @classmethod

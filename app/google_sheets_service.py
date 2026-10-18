@@ -528,6 +528,48 @@ class GoogleSheetsService:
         content = drive.files().get_media(fileId=chosen["id"]).execute()
         return content, chosen.get("mimeType", "application/octet-stream")
 
+    async def find_probation_form_link(
+        self, root_folder_id: str, year: int, month: int, chinese_name: str
+    ) -> str | None:
+        """转正表单链接：在"<root_folder_id>/<年>-<月>月转正明细"（文件夹名格式不完全统一，
+        按"包含年份数字 + 月份数字+月"模糊匹配）里按花名找该员工的表单文件，返回可分享链接。"""
+        return await asyncio.to_thread(
+            self._find_probation_form_link, root_folder_id, year, month, chinese_name
+        )
+
+    def _find_probation_form_link(
+        self, root_folder_id: str, year: int, month: int, chinese_name: str
+    ) -> str | None:
+        chinese_name = str(chinese_name or "").strip()
+        if not chinese_name or not root_folder_id:
+            return None
+        drive = self._drive_service()
+        folder_query = (
+            f"'{root_folder_id}' in parents and trashed = false "
+            "and mimeType = 'application/vnd.google-apps.folder'"
+        )
+        folder_response = drive.files().list(
+            q=folder_query, fields="files(id, name)", pageSize=50,
+        ).execute()
+        month_folders = [
+            f for f in folder_response.get("files", [])
+            if str(year) in f["name"] and f"{month}月" in f["name"]
+        ]
+        if not month_folders:
+            return None
+        subfolder_id = month_folders[0]["id"]
+        safe_name = chinese_name.replace("'", "\\'")
+        file_query = f"'{subfolder_id}' in parents and trashed = false and name contains '{safe_name}'"
+        file_response = drive.files().list(
+            q=file_query, fields="files(id, name, webViewLink)", pageSize=20,
+        ).execute()
+        files = file_response.get("files", [])
+        if not files:
+            return None
+        exact = [f for f in files if Path(f["name"]).stem.strip() == chinese_name]
+        chosen = exact[0] if exact else files[0]
+        return chosen.get("webViewLink") or f"https://drive.google.com/file/d/{chosen['id']}/view"
+
     def _today_hires(self, today: date) -> list[dict[str, str]]:
         service = self._service()
         last = ROSTER_COLUMNS["work_tg"]
