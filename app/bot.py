@@ -244,15 +244,39 @@ ONBOARDING_DEPARTMENT_MENTIONS: dict[str, tuple[str, ...]] = {
 }
 # 这两个部门：私人TG/工作TG/工作Gmail 三个字段都要写（没有就写"待补充"）。
 # 其他部门：只写私人TG，工作TG 和 工作Gmail 这两行整行不写。
-ONBOARDING_WORK_CONTACT_DEPARTMENTS = frozenset({"研发部", "效能部"})
+ONBOARDING_WORK_CONTACT_DEPARTMENTS = ("研发部", "效能部")
+
+_ONBOARDING_NUMERAL_MAP = str.maketrans({"一": "1", "二": "2", "三": "3", "四": "4", "五": "5"})
+
+
+def _onboarding_normalize(text: str) -> str:
+    """部门/小组字段做模糊匹配前的归一化：去空格、中文数字转阿拉伯数字。"""
+    return text.strip().translate(_ONBOARDING_NUMERAL_MAP)
+
+
+def _onboarding_department_matches(department: str, key: str) -> bool:
+    """real 花名册 department 字段经常是"部门+小组"连写、或中文数字写成阿拉伯数字
+    （如 "运营1部产品运营组"），所以用归一化后的包含匹配，而不是精确相等。"""
+    norm_department = _onboarding_normalize(department)
+    norm_key = _onboarding_normalize(key)
+    return norm_key in norm_department
 
 
 def _onboarding_mentions_for(department: str, team: str) -> tuple[str, ...]:
     department = department.strip()
     team = team.strip()
-    if (department, team) in ONBOARDING_TEAM_MENTIONS:
-        return ONBOARDING_TEAM_MENTIONS[(department, team)]
-    return ONBOARDING_DEPARTMENT_MENTIONS.get(department, ())
+    # 团队级规则优先于部门级规则，同样用归一化包含匹配。
+    for (team_dept, team_name), handles in ONBOARDING_TEAM_MENTIONS.items():
+        if _onboarding_department_matches(department, team_dept) and _onboarding_department_matches(team, team_name):
+            return handles
+    for dept_key, handles in ONBOARDING_DEPARTMENT_MENTIONS.items():
+        if _onboarding_department_matches(department, dept_key):
+            return handles
+    return ()
+
+
+def _onboarding_has_work_contact_fields(department: str) -> bool:
+    return any(_onboarding_department_matches(department, key) for key in ONBOARDING_WORK_CONTACT_DEPARTMENTS)
 
 
 def _onboarding_all_mentions(candidates: list[dict[str, str]]) -> list[str]:
@@ -291,7 +315,7 @@ def _build_onboarding_notice_block(candidate: dict[str, str]) -> str:
         f"部门-小组：{department}-{team}",
         f"私人TG：{private_tg}",
     ]
-    if department in ONBOARDING_WORK_CONTACT_DEPARTMENTS:
+    if _onboarding_has_work_contact_fields(department):
         same_as_private = bool(work_tg) and work_tg.lstrip("@").casefold() == private_tg.lstrip("@").casefold()
         work_tg_display = "待补充" if (not work_tg or same_as_private) else work_tg
         lines.append(f"工作TG: {work_tg_display}")
@@ -312,7 +336,10 @@ def _build_onboarding_sync_block(candidate: dict[str, str]) -> str:
     service_entity = str(candidate.get("service_entity") or "").strip()
     department = str(candidate.get("department") or "").strip()
     team = str(candidate.get("team") or "").strip()
-    return "\n".join([
+    private_tg = str(candidate.get("private_contact") or "").strip()
+    work_tg = str(candidate.get("work_tg") or "").strip()
+    work_email = str(candidate.get("work_email") or "").strip()
+    lines = [
         f"入职日期：{candidate.get('hire_date') or candidate.get('effective_date') or ''}",
         f"编号：{candidate.get('employee_code') or ''}",
         f"花名：{candidate.get('chinese_name') or ''}",
@@ -322,10 +349,14 @@ def _build_onboarding_sync_block(candidate: dict[str, str]) -> str:
         f"直属上级：{candidate.get('direct_supervisor') or ''}",
         f"岗位：{candidate.get('position_title') or ''}",
         f"简历来源：{candidate.get('resume_source') or ''}",
-        f"私人TG：{candidate.get('private_contact') or ''}",
-        f"工作TG：{candidate.get('work_tg') or ''}",
-        f"工作Gmail：{candidate.get('work_email') or ''}",
-    ])
+        f"私人TG：{private_tg}",
+    ]
+    if _onboarding_has_work_contact_fields(department):
+        same_as_private = bool(work_tg) and work_tg.lstrip("@").casefold() == private_tg.lstrip("@").casefold()
+        work_tg_display = "待补充" if (not work_tg or same_as_private) else work_tg
+        lines.append(f"工作TG：{work_tg_display}")
+        lines.append(f"工作Gmail：{work_email or '待补充'}")
+    return "\n".join(lines)
 
 
 def build_onboarding_sync(candidates: list[dict[str, str]]) -> str:
