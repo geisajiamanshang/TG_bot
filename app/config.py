@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     wallet_spreadsheet_id: str = "1SrvH7LuKqlekXzUUxbMAY3VNT54ApXNqG6bki9bnhXQ"
     wallet_assistant_chat_id: int | None = None
     wallet_workflow_enabled: bool = False
+    # /onboarding_notify 用：恒睿公司-联合管理工作群（新人入职通知）、人事数据同步-SSC3组（入职信息同步）。
+    # 机器人必须已经是这两个群的成员才能发消息；群 chat_id 通常是负数。
+    onboarding_notify_group_chat_id: int | None = None
+    onboarding_sync_group_chat_id: int | None = None
 
     @field_validator("admin_user_ids", mode="before")
     @classmethod

@@ -4,8 +4,9 @@ import asyncio
 import hashlib
 import io
 import logging
+import random
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
@@ -165,6 +166,10 @@ class SupervisorNotify(StatesGroup):
     waiting_for_confirmation = State()
 
 
+class OnboardingNotify(StatesGroup):
+    waiting_for_confirmation = State()
+
+
 def build_supervisor_groups(
     hires: list[dict[str, str]],
     supervisor_contacts: list[dict[str, str]],
@@ -217,6 +222,119 @@ def supervisor_notice_text(supervisor: str, hires: list[dict[str, str]], today: 
     return "\n".join(lines)
 
 
+# ---- /onboarding_notify：今日入职 -> 【新人入职通知】【入职信息同步】两个群通知的生成规则 ----
+# 规则来源：用户上传的模版文件（2026-10-17），不要凭记忆改动，以模版原文为准。
+
+ONBOARDING_BASE_MENTIONS: tuple[str, ...] = ("DaBai10010", "wean4790")
+
+# (部门, 小组) 精确匹配优先于按部门匹配。
+ONBOARDING_TEAM_MENTIONS: dict[tuple[str, str], tuple[str, ...]] = {
+    ("ACFAN特战队", "内容组"): ("linerkang", "wean4790"),
+    ("ACFAN特战队", "SEO组"): ("linerkang", "wean4790"),
+    ("研发部", "前端组"): ("wdz999", "feang99568", "kcin895"),
+    ("研发部", "后端组"): ("liyuanba666", "feang99568", "kcin895"),
+}
+ONBOARDING_DEPARTMENT_MENTIONS: dict[str, tuple[str, ...]] = {
+    "效能部": ("linerkang", "wean4790"),
+    "AIGC原创部": ("linerkang", "wean4790"),
+    "运营一部": ("FWN066", "zlei1216"),
+    "运营二部": ("xxs202215cz2025", "wean4790"),
+    # 其他未命中具体小组规则的 ACFAN特战队。
+    "ACFAN特战队": ("wean4790", "zlei1216"),
+}
+# 这两个部门：私人TG/工作TG/工作Gmail 三个字段都要写（没有就写"待补充"）。
+# 其他部门：只写私人TG，工作TG 和 工作Gmail 这两行整行不写。
+ONBOARDING_WORK_CONTACT_DEPARTMENTS = frozenset({"研发部", "效能部"})
+
+
+def _onboarding_mentions_for(department: str, team: str) -> tuple[str, ...]:
+    department = department.strip()
+    team = team.strip()
+    if (department, team) in ONBOARDING_TEAM_MENTIONS:
+        return ONBOARDING_TEAM_MENTIONS[(department, team)]
+    return ONBOARDING_DEPARTMENT_MENTIONS.get(department, ())
+
+
+def _onboarding_all_mentions(candidates: list[dict[str, str]]) -> list[str]:
+    """所有候选人适用规则的并集去重（含固定的 base mentions），保留首次出现的顺序。"""
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def add(handle: str) -> None:
+        handle = handle.strip()
+        if handle and handle not in seen:
+            seen.add(handle)
+            ordered.append(handle)
+
+    for handle in ONBOARDING_BASE_MENTIONS:
+        add(handle)
+    for candidate in candidates:
+        for handle in _onboarding_mentions_for(
+            str(candidate.get("department") or ""), str(candidate.get("team") or "")
+        ):
+            add(handle)
+    return ordered
+
+
+def _build_onboarding_notice_block(candidate: dict[str, str]) -> str:
+    department = str(candidate.get("department") or "").strip()
+    team = str(candidate.get("team") or "").strip()
+    private_tg = str(candidate.get("private_contact") or "").strip()
+    work_tg = str(candidate.get("work_tg") or "").strip()
+    work_email = str(candidate.get("work_email") or "").strip()
+    lines = [
+        f"日期：{candidate.get('effective_date') or ''}",
+        f"花名：{candidate.get('chinese_name') or ''}",
+        f"简历名：{candidate.get('resume_name') or ''}",
+        f"编号：{candidate.get('employee_code') or ''}",
+        f"岗位：{candidate.get('position_title') or ''}",
+        f"部门-小组：{department}-{team}",
+        f"私人TG：{private_tg}",
+    ]
+    if department in ONBOARDING_WORK_CONTACT_DEPARTMENTS:
+        same_as_private = bool(work_tg) and work_tg.lstrip("@").casefold() == private_tg.lstrip("@").casefold()
+        work_tg_display = "待补充" if (not work_tg or same_as_private) else work_tg
+        lines.append(f"工作TG: {work_tg_display}")
+        lines.append(f"工作Gmail: {work_email or '待补充'}")
+    return "\n".join(lines)
+
+
+def build_onboarding_notice(candidates: list[dict[str, str]]) -> str:
+    """【新人入职通知】：多人之间用 ——— 分隔，结尾一条合并去重的 @提醒 备注。"""
+    blocks = [_build_onboarding_notice_block(candidate) for candidate in candidates]
+    mentions = " ".join(f"@{handle}" for handle in _onboarding_all_mentions(candidates))
+    body = "\n\n———\n\n".join(blocks)
+    return f"【新人入职通知】\n\n{body}\n\n备注：已培训完成，{mentions} 请知悉"
+
+
+def _build_onboarding_sync_block(candidate: dict[str, str]) -> str:
+    org_unit = str(candidate.get("org_unit") or "").strip()
+    service_entity = str(candidate.get("service_entity") or "").strip()
+    department = str(candidate.get("department") or "").strip()
+    team = str(candidate.get("team") or "").strip()
+    return "\n".join([
+        f"入职日期：{candidate.get('hire_date') or candidate.get('effective_date') or ''}",
+        f"编号：{candidate.get('employee_code') or ''}",
+        f"花名：{candidate.get('chinese_name') or ''}",
+        f"简历名：{candidate.get('resume_name') or ''}",
+        f"部门：{org_unit}-{service_entity}",
+        f"小组：{department}-{team}",
+        f"直属上级：{candidate.get('direct_supervisor') or ''}",
+        f"岗位：{candidate.get('position_title') or ''}",
+        f"简历来源：{candidate.get('resume_source') or ''}",
+        f"私人TG：{candidate.get('private_contact') or ''}",
+        f"工作TG：{candidate.get('work_tg') or ''}",
+        f"工作Gmail：{candidate.get('work_email') or ''}",
+    ])
+
+
+def build_onboarding_sync(candidates: list[dict[str, str]]) -> str:
+    """【入职信息同步】：多人之间用 ——— 分隔，没有结尾备注行。"""
+    blocks = [_build_onboarding_sync_block(candidate) for candidate in candidates]
+    body = "\n\n———\n\n".join(blocks)
+    return f"【入职信息同步】\n\n{body}"
+
+
 class TemplateCreate(StatesGroup):
     waiting_for_name = State()
     waiting_for_content = State()
@@ -230,6 +348,8 @@ class Services:
     sheets: GoogleSheetsService
     vision: VisionService
     gpt: GPTService
+    # /onboarding_notify：管理员 user_id -> 下午待发"入职信息同步"的后台任务，/cancel 时用来撤销。
+    onboarding_sync_tasks: dict[int, asyncio.Task] = field(default_factory=dict)
 
 
 def _is_admin(user_id: int, settings: Settings) -> bool:
@@ -638,6 +758,11 @@ def build_dispatcher(services: Services) -> Dispatcher:
     @router.message(Command("cancel"))
     async def cancel(message: Message, state: FSMContext) -> None:
         await state.clear()
+        if message.from_user:
+            # /onboarding_notify 下午待发送的【入职信息同步】后台任务也一并撤销。
+            task = services.onboarding_sync_tasks.pop(message.from_user.id, None)
+            if task and not task.done():
+                task.cancel()
         await message.answer("操作已取消。")
 
     @router.message(Command("stats"))
@@ -946,6 +1071,130 @@ def build_dispatcher(services: Services) -> Dispatcher:
             if failed:
                 lines.append("\n❌ 失败：\n" + "\n".join(failed))
             await callback.message.answer("\n".join(lines)[:3900])
+
+    @router.message(Command("onboarding_notify"))
+    async def onboarding_notify_start(message: Message, state: FSMContext) -> None:
+        if not message.from_user or not _is_admin(message.from_user.id, services.settings):
+            await message.answer("无权使用此命令。")
+            return
+        if not services.sheets.configured:
+            await message.answer("Google 花名册尚未配置，无法查询。")
+            return
+        if not services.settings.onboarding_notify_group_chat_id or not services.settings.onboarding_sync_group_chat_id:
+            await message.answer(
+                "尚未配置 ONBOARDING_NOTIFY_GROUP_CHAT_ID / ONBOARDING_SYNC_GROUP_CHAT_ID，"
+                "请先在 .env 里配置这两个群的 chat_id 后再使用本命令。"
+            )
+            return
+        today = datetime.now(ATTENDANCE_TIMEZONE).date()
+        await message.answer(f"正在只读查询花名册 G 列生效日期为 {today.isoformat()} 的新人……")
+        try:
+            candidates = await services.sheets.onboarding_notify_candidates(today)
+        except Exception as exc:
+            logger.exception("Onboarding notify lookup failed")
+            await message.answer(f"花名册读取失败：{str(exc)[:160]}")
+            return
+        if not candidates:
+            await message.answer(f"今天（{today.isoformat()}）花名册里没有生效日期是今天的新人。")
+            return
+
+        notice_text = build_onboarding_notice(candidates)
+        sync_text = build_onboarding_sync(candidates)
+        names = "、".join(str(candidate.get("chinese_name") or "") for candidate in candidates)
+
+        await state.clear()
+        await state.set_state(OnboardingNotify.waiting_for_confirmation)
+        await state.update_data(
+            onboarding_notice_text=notice_text,
+            onboarding_sync_text=sync_text,
+        )
+
+        preview = (
+            f"今日入职 {len(candidates)} 人：{names}\n\n"
+            f"———【新人入职通知】预览（将发到恒睿公司-联合管理工作群）———\n\n{notice_text}\n\n"
+            f"———【入职信息同步】预览（下午随机 15:15-18:00 之间发到人事数据同步-SSC3组）———\n\n{sync_text}\n\n"
+            "回复 1 确认发送；回复 /cancel 取消本轮。"
+        )
+        preview_message_ids: list[int] = []
+        for start in range(0, len(preview), 3700):
+            sent = await message.answer(preview[start:start + 3700])
+            preview_message_ids.append(sent.message_id)
+        await state.update_data(onboarding_preview_message_ids=preview_message_ids)
+
+    @router.message(OnboardingNotify.waiting_for_confirmation, F.text)
+    async def onboarding_notify_confirm(message: Message, state: FSMContext, bot: Bot) -> None:
+        if not message.from_user or not _is_admin(message.from_user.id, services.settings):
+            await state.clear()
+            return
+        text = (message.text or "").strip()
+        if text.casefold().startswith("/cancel"):
+            return  # 交给全局 /cancel 命令处理
+        if text != "1":
+            await message.answer("回复 1 确认发送到群；或回复 /cancel 取消本轮。")
+            return
+
+        data = await state.get_data()
+        notice_text = str(data.get("onboarding_notice_text") or "")
+        sync_text = str(data.get("onboarding_sync_text") or "")
+        preview_message_ids = [int(value) for value in data.get("onboarding_preview_message_ids") or []]
+        admin_id = message.from_user.id
+        chat_id = message.chat.id
+        notify_chat_id = services.settings.onboarding_notify_group_chat_id
+        sync_chat_id = services.settings.onboarding_sync_group_chat_id
+        await state.clear()
+
+        if not notice_text or not sync_text or notify_chat_id is None or sync_chat_id is None:
+            await message.answer("本轮预览已失效，请重新执行 /onboarding_notify。")
+            return
+
+        try:
+            await bot.send_message(notify_chat_id, notice_text)
+        except Exception as exc:
+            logger.exception("Onboarding notice send failed")
+            await message.answer(
+                f"发送【新人入职通知】到群失败：{str(exc)[:160]}；本轮已终止，下午的入职信息同步也不会发送。"
+            )
+            return
+        await message.answer("✅ 【新人入职通知】已发送到恒睿公司-联合管理工作群。")
+
+        now = datetime.now(ATTENDANCE_TIMEZONE)
+        window_start = now.replace(hour=15, minute=15, second=0, microsecond=0)
+        window_end = now.replace(hour=18, minute=0, second=0, microsecond=0)
+        if now >= window_end:
+            target = now + timedelta(seconds=5)
+            await message.answer("现在已经过了 15:15-18:00 这个时间段，【入职信息同步】将在几秒后直接发送。")
+        else:
+            start_from = max(now, window_start)
+            span_seconds = max(0, int((window_end - start_from).total_seconds()))
+            target = start_from + timedelta(seconds=random.randint(0, span_seconds))
+            await message.answer(f"已安排今天 {target.strftime('%H:%M')} 左右发送【入职信息同步】到人事数据同步-SSC3组。")
+
+        async def _send_sync_later() -> None:
+            try:
+                delay = max(0.0, (target - datetime.now(ATTENDANCE_TIMEZONE)).total_seconds())
+                await asyncio.sleep(delay)
+                await bot.send_message(sync_chat_id, sync_text)
+                await bot.send_message(chat_id, "✅ 【入职信息同步】已发送到人事数据同步-SSC3组。本轮入职通知转发完成。")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Onboarding sync send failed")
+                try:
+                    await bot.send_message(chat_id, "发送【入职信息同步】到群失败，请人工处理。")
+                except Exception:
+                    logger.exception("Failed to notify admin about onboarding sync failure")
+            finally:
+                services.onboarding_sync_tasks.pop(admin_id, None)
+                for message_id in preview_message_ids:
+                    try:
+                        await bot.delete_message(chat_id, message_id)
+                    except Exception:
+                        logger.exception("Failed to delete onboarding preview message %s", message_id)
+
+        existing = services.onboarding_sync_tasks.pop(admin_id, None)
+        if existing and not existing.done():
+            existing.cancel()
+        services.onboarding_sync_tasks[admin_id] = asyncio.create_task(_send_sync_later())
 
     @router.callback_query(F.data == "channelmsg:cancel")
     async def channel_message_cancel(callback: CallbackQuery, state: FSMContext) -> None:
@@ -1887,6 +2136,7 @@ ADMIN_COMMANDS = [
     BotCommand(command="roster", description="管理员查看本地花名册"),
     BotCommand(command="send_channel_msg", description="检查频道消息待处理名单"),
     BotCommand(command="notify_supervisor", description="把今日入职新人发给其直接上级"),
+    BotCommand(command="onboarding_notify", description="今日入职通知转发到群"),
 ]
 
 

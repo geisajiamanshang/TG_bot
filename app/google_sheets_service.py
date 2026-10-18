@@ -359,6 +359,55 @@ class GoogleSheetsService:
         """Read-only: 表格一花名册中 G 列（生效日期）等于 today 的员工的 C 花名、AE 工作TG、AA 直接上级。"""
         return await asyncio.to_thread(self._today_hires, today)
 
+    async def onboarding_notify_candidates(self, today: date) -> list[dict[str, str]]:
+        """Read-only，供 /onboarding_notify 用：花名册 G 列生效日期等于 today 的所有员工，取
+        【新人入职通知】【入职信息同步】两个模版需要的全部字段。"""
+        return await asyncio.to_thread(self._onboarding_notify_candidates, today)
+
+    def _onboarding_notify_candidates(self, today: date) -> list[dict[str, str]]:
+        service = self._service()
+        last = HIRE_DATE_COLUMN  # AR，覆盖到最后需要读取的列
+        rows = self._read_rows(service, ROSTER_SHEET, f"A{ROSTER_START_ROW}:{last}5000")
+
+        def idx(column: str) -> int:
+            return self._column_index(column)
+
+        fields = {
+            "employee_code": idx(ROSTER_COLUMNS["employee_code"]),       # B 编号
+            "chinese_name": idx(ROSTER_COLUMNS["chinese_name"]),         # C 花名
+            "resume_name": idx(ROSTER_COLUMNS["resume_name"]),           # E 简历名
+            "effective_date": idx(ROSTER_COLUMNS["effective_date"]),     # G 日期
+            "org_unit": idx(EXTRA_ORG_COLUMNS["org_unit"]),              # M 编制组织
+            "department": idx(EXTRA_ORG_COLUMNS["department"]),          # P 部门
+            "team": idx(EXTRA_ORG_COLUMNS["team"]),                      # Q 小组
+            "position_title": idx(EXTRA_ORG_COLUMNS["position_title"]),  # U 岗位
+            "direct_supervisor": idx(EXTRA_ORG_COLUMNS["direct_supervisor"]),  # AA 直属上级
+            "service_entity": idx(EXTRA_ORG_COLUMNS["service_entity"]),  # O 派驻公司
+            "resume_source": idx(EXTRA_ORG_COLUMNS["resume_source"]),    # AQ 简历来源
+            "work_tg": idx(ROSTER_COLUMNS["work_tg"]),                   # AE 工作TG
+            "private_contact": idx(ROSTER_COLUMNS["private_contact"]),   # AF 私人TG
+            "work_email": idx(ROSTER_COLUMNS["work_email"]),             # AG 工作Gmail
+            "hire_date": idx(HIRE_DATE_COLUMN),                          # AR 入职日期
+        }
+
+        def cell(row: list[object], index: int) -> str:
+            return str(row[index]).strip() if len(row) > index else ""
+
+        date_index = fields["effective_date"]
+        name_index = fields["chinese_name"]
+        results: list[dict[str, str]] = []
+        for row_number, row in enumerate(rows, start=ROSTER_START_ROW):
+            if parse_sheet_date(cell(row, date_index)) != today:
+                continue
+            name = cell(row, name_index)
+            if not name:
+                continue
+            record = {"row": str(row_number)}
+            for key, index in fields.items():
+                record[key] = cell(row, index)
+            results.append(record)
+        return results
+
     def _today_hires(self, today: date) -> list[dict[str, str]]:
         service = self._service()
         last = ROSTER_COLUMNS["work_tg"]
