@@ -369,7 +369,8 @@ class GoogleSheetsService:
         return results
 
     async def today_hires(self, today: date) -> list[dict[str, str]]:
-        """Read-only: 表格一花名册中 G 列（生效日期）等于 today 的员工的 C 花名、AE 工作TG、AA 直接上级。"""
+        """Read-only: 表格一花名册中 G 列（生效日期）等于 today 的员工的 C 花名、E 简历名、
+        AE 工作TG、AA 直接上级。"""
         return await asyncio.to_thread(self._today_hires, today)
 
     async def onboarding_notify_candidates(self, today: date) -> list[dict[str, str]]:
@@ -644,6 +645,7 @@ class GoogleSheetsService:
         last = ROSTER_COLUMNS["work_tg"]
         rows = self._read_rows(service, ROSTER_SHEET, f"A{ROSTER_START_ROW}:{last}5000")
         name_index = self._column_index(ROSTER_COLUMNS["chinese_name"])
+        resume_name_index = self._column_index(ROSTER_COLUMNS["resume_name"])
         date_index = self._column_index(ROSTER_COLUMNS["effective_date"])
         tg_index = self._column_index(ROSTER_COLUMNS["work_tg"])
         supervisor_index = self._column_index(EXTRA_ORG_COLUMNS["direct_supervisor"])
@@ -662,6 +664,7 @@ class GoogleSheetsService:
             results.append({
                 "row": str(row_number),
                 "chinese_name": name,
+                "resume_name": cell(row, resume_name_index),
                 "work_tg": f"@{username}" if username else "",
                 "supervisor": cell(row, supervisor_index),
             })

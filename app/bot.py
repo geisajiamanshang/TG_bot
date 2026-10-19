@@ -238,7 +238,8 @@ def supervisor_notice_text(supervisor: str, hires: list[dict[str, str]], today: 
         f"{supervisor}您好！以下新同事今天（{today}）入职，直接上级为您，请知悉并及时联系：",
     ]
     for index, hire in enumerate(hires, 1):
-        lines.append(f"{index}. {hire['chinese_name']}｜{hire.get('work_tg') or '工作TG待补充'}")
+        resume_name = hire.get("resume_name") or "简历名待补充"
+        lines.append(f"{index}. {hire['chinese_name']}｜{resume_name}｜{hire.get('work_tg') or '工作TG待补充'}")
     return "\n".join(lines)
 
 
