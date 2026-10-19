@@ -378,6 +378,47 @@ class GoogleSheetsService:
         【新人入职通知】【入职信息同步】两个模版需要的全部字段。"""
         return await asyncio.to_thread(self._onboarding_notify_candidates, today)
 
+    async def training_notify_candidates(self, tomorrow: date) -> list[dict[str, str]]:
+        """Read-only，供 /training_notify 用：花名册 G 列生效日期等于 tomorrow（明天）的所有
+        员工，取【次日培训信息同步】模版需要的字段：E 简历名、M 编制组织、O 服务单位、
+        P 部门、Q 小组、U 岗位。"""
+        return await asyncio.to_thread(self._training_notify_candidates, tomorrow)
+
+    def _training_notify_candidates(self, tomorrow: date) -> list[dict[str, str]]:
+        service = self._service()
+        last = EXTRA_ORG_COLUMNS["position_title"]  # U，覆盖到最后需要读取的列
+        rows = self._read_rows(service, ROSTER_SHEET, f"A{ROSTER_START_ROW}:{last}5000")
+
+        def idx(column: str) -> int:
+            return self._column_index(column)
+
+        fields = {
+            "resume_name": idx(ROSTER_COLUMNS["resume_name"]),            # E 简历名
+            "effective_date": idx(ROSTER_COLUMNS["effective_date"]),      # G 生效日期
+            "org_unit": idx(EXTRA_ORG_COLUMNS["org_unit"]),                # M 编制组织
+            "service_entity": idx(EXTRA_ORG_COLUMNS["service_entity"]),    # O 服务单位
+            "department": idx(EXTRA_ORG_COLUMNS["department"]),            # P 部门
+            "team": idx(EXTRA_ORG_COLUMNS["team"]),                        # Q 小组
+            "position_title": idx(EXTRA_ORG_COLUMNS["position_title"]),    # U 岗位
+        }
+
+        def cell(row: list[object], index: int) -> str:
+            return str(row[index]).strip() if len(row) > index else ""
+
+        date_index = fields["effective_date"]
+        resume_name_index = fields["resume_name"]
+        results: list[dict[str, str]] = []
+        for row_number, row in enumerate(rows, start=ROSTER_START_ROW):
+            if parse_sheet_date(cell(row, date_index)) != tomorrow:
+                continue
+            if not cell(row, resume_name_index):
+                continue
+            record = {"row": str(row_number)}
+            for key, index in fields.items():
+                record[key] = cell(row, index)
+            results.append(record)
+        return results
+
     def _onboarding_notify_candidates(self, today: date) -> list[dict[str, str]]:
         service = self._service()
         last = HIRE_DATE_COLUMN  # AR，覆盖到最后需要读取的列

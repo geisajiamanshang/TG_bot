@@ -182,6 +182,12 @@ class ProbationNotify(StatesGroup):
     waiting_for_action = State()
 
 
+class TrainingNotify(StatesGroup):
+    # 只支持发送前编辑（没有发送后"✏️ 编辑这条消息"按钮，这是用户明确要求的范围）。
+    waiting_for_confirmation = State()
+    waiting_for_edit_text = State()
+
+
 class EditSentMessage(StatesGroup):
     # 入职通知/入职信息同步/转正提醒/转正通知/转正信息同步 发到群之后，管理员点"✏️ 编辑这条消息"
     # 按钮进入这个状态，回复新内容就用 bot 自己的身份把群里那条消息编辑掉（普通用户改不了机器人发的
@@ -413,6 +419,40 @@ def build_onboarding_sync(candidates: list[dict[str, str]]) -> str:
     blocks = [_build_onboarding_sync_block(candidate) for candidate in candidates]
     body = "\n\n———\n\n".join(blocks)
     return f"【入职信息同步】\n\n{body}"
+
+
+# ---- /training_notify：明日入职 -> 【次日培训信息同步】----
+# 2026-10-19 用户要求：按编制组织（M列）分组，每组一行"{编制组织}-{服务单位} N人"标题，
+# 组内/组间都用 ——— 分隔（和入职通知模版同样的分隔风格）。
+
+def build_training_notice(candidates: list[dict[str, str]]) -> str:
+    """【次日培训信息同步】：按编制组织（M列）分组，组内按花名册行顺序排列，组与组、
+    人与人之间统一用 ——— 分隔；只有每组第一个人的区块带"{编制组织}-{服务单位} N人"标题。"""
+    groups: dict[str, list[dict[str, str]]] = {}
+    for candidate in candidates:
+        org_unit = str(candidate.get("org_unit") or "").strip() or "未知编制组织"
+        groups.setdefault(org_unit, []).append(candidate)
+
+    blocks: list[str] = []
+    for org_unit, group in groups.items():
+        service_entity = str(group[0].get("service_entity") or "").strip() or "恒睿"
+        header = f"{org_unit}-{service_entity} {len(group)}人"
+        for index, candidate in enumerate(group):
+            department = str(candidate.get("department") or "").strip()
+            team = str(candidate.get("team") or "").strip()
+            lines = [
+                f"入职时间：{candidate.get('effective_date') or ''}",
+                f"岗位：{candidate.get('position_title') or ''}",
+                f"部门：{department}-{team}",
+                f"简历名：{candidate.get('resume_name') or ''}",
+            ]
+            block = "\n".join(lines)
+            if index == 0:
+                block = f"{header}\n{block}"
+            blocks.append(block)
+
+    body = "\n\n———\n\n".join(blocks)
+    return f"【次日培训信息同步】\n\n{body}"
 
 
 # ---- /probation_notify：今日转正 -> 【新人预转正提醒】【转正申请】【转正通知】【转正信息同步】----
@@ -1741,6 +1781,83 @@ def build_dispatcher(services: Services) -> Dispatcher:
         await message.answer("已更新，预览如下：")
         await _onboarding_send_preview(message, state, notice_text, sync_text, str(data.get("onboarding_names") or ""))
 
+    @router.message(Command("training_notify"))
+    async def training_notify_start(message: Message, state: FSMContext) -> None:
+        if not message.from_user or not _is_admin(message.from_user.id, services.settings):
+            await message.answer("无权使用此命令。")
+            return
+        if not services.sheets.configured:
+            await message.answer("Google 花名册尚未配置，无法查询。")
+            return
+        tomorrow = datetime.now(ATTENDANCE_TIMEZONE).date() + timedelta(days=1)
+        await message.answer(f"正在只读查询花名册 G 列生效日期为 {tomorrow.isoformat()}（明天）的新人……")
+        try:
+            candidates = await services.sheets.training_notify_candidates(tomorrow)
+        except Exception as exc:
+            logger.exception("Training notify lookup failed")
+            await message.answer(f"花名册读取失败：{str(exc)[:160]}")
+            return
+        if not candidates:
+            await message.answer(f"明天（{tomorrow.isoformat()}）花名册里没有生效日期是明天的新人。")
+            return
+
+        training_text = build_training_notice(candidates)
+        await state.clear()
+        await state.set_state(TrainingNotify.waiting_for_confirmation)
+        await state.update_data(training_text=training_text)
+        await _training_send_preview(message, state, training_text)
+
+    async def _training_send_preview(message: Message, state: FSMContext, training_text: str) -> None:
+        preview = (
+            f"———【次日培训信息同步】预览（将发到人事数据同步-SSC3组）———\n\n{training_text}\n\n"
+            "回复 1 确认发送；回复 编辑 可以在发送前修改内容；回复 /cancel 取消本轮。"
+        )
+        for start in range(0, len(preview), 3700):
+            await message.answer(preview[start:start + 3700])
+
+    @router.message(TrainingNotify.waiting_for_confirmation, F.text)
+    async def training_notify_confirm(message: Message, state: FSMContext, bot: Bot) -> None:
+        if not message.from_user or not _is_admin(message.from_user.id, services.settings):
+            await state.clear()
+            return
+        text = (message.text or "").strip()
+        if text.casefold().startswith("/cancel"):
+            return  # 交给全局 /cancel 命令处理
+        if text == "编辑":
+            await state.set_state(TrainingNotify.waiting_for_edit_text)
+            await message.answer("请发送【次日培训信息同步】的新内容（整段替换，不是在原文上增量修改）。")
+            return
+        if text != "1":
+            await message.answer("回复 1 确认发送到群；回复 编辑 可以先修改内容；或回复 /cancel 取消本轮。")
+            return
+
+        data = await state.get_data()
+        training_text = str(data.get("training_text") or "")
+        await state.clear()
+        if not training_text:
+            await message.answer("本轮预览已失效，请重新执行 /training_notify。")
+            return
+        try:
+            await bot.send_message(services.settings.training_notify_group_chat_id, training_text)
+        except Exception as exc:
+            logger.exception("Training notify send failed")
+            await message.answer(f"发送【次日培训信息同步】到群失败：{str(exc)[:160]}")
+            return
+        await message.answer("✅ 【次日培训信息同步】已发送到人事数据同步-SSC3组。")
+
+    @router.message(TrainingNotify.waiting_for_edit_text, F.text)
+    async def training_notify_edit_text(message: Message, state: FSMContext) -> None:
+        if not message.from_user or not _is_admin(message.from_user.id, services.settings):
+            await state.clear()
+            return
+        text = message.text or ""
+        if text.strip().casefold().startswith("/cancel"):
+            return  # 交给全局 /cancel 命令处理
+        await state.update_data(training_text=text)
+        await state.set_state(TrainingNotify.waiting_for_confirmation)
+        await message.answer("已更新，预览如下：")
+        await _training_send_preview(message, state, text)
+
     @router.message(Command("probation_notify"))
     async def probation_notify_start(message: Message, state: FSMContext, bot: Bot) -> None:
         if not message.from_user or not _is_admin(message.from_user.id, services.settings):
@@ -2929,6 +3046,7 @@ ADMIN_COMMANDS = [
     BotCommand(command="notify_supervisor", description="把今日入职新人发给其直接上级"),
     BotCommand(command="onboarding_notify", description="今日入职通知转发到群"),
     BotCommand(command="probation_notify", description="今日转正提醒/转正通知转发到群"),
+    BotCommand(command="training_notify", description="次日培训信息同步转发到群"),
 ]
 
 

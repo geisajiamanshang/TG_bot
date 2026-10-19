@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     # 的子文件夹分月存放，没有就自动新建）。服务账号必须被额外共享这个文件夹的【编辑者】权限
     # （不是查看者），因为这个功能需要往里面写文件，不只是读。
     onboarding_agreement_drive_folder_id: str = "1tmNkfhM35ZbYYXu1UncC7dZCsbx_BUJq"
+    # /training_notify 用：人事数据同步-SSC3组（次日培训信息同步），和 probation_sync_group_chat_id
+    # 是同一个群，这里保留一个独立字段方便以后拆开配置。
+    training_notify_group_chat_id: int = -1004468512291
 
     @field_validator("admin_user_ids", mode="before")
     @classmethod
