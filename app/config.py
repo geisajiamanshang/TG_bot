@@ -41,9 +41,10 @@ class Settings(BaseSettings):
     # 的子文件夹分月存放，没有就自动新建）。服务账号必须被额外共享这个文件夹的【编辑者】权限
     # （不是查看者），因为这个功能需要往里面写文件，不只是读。
     onboarding_agreement_drive_folder_id: str = "1tmNkfhM35ZbYYXu1UncC7dZCsbx_BUJq"
-    # /training_notify 用：人事数据同步-SSC3组（次日培训信息同步），和 probation_sync_group_chat_id
-    # 是同一个群，这里保留一个独立字段方便以后拆开配置。
-    training_notify_group_chat_id: int = -1004468512291
+    # /training_notify 用：人事数据同步-SSC3组（次日培训信息同步）。注意这里不单独起一个字段，
+    # 直接复用 probation_sync_group_chat_id——这就是"转正信息同步"实际在用、已经验证能发送成功
+    # 的那个群 chat_id。之前单独给了一个硬编码默认值，结果和用户 .env 里真正配置的
+    # PROBATION_SYNC_GROUP_CHAT_ID 不一致，导致 "chat not found"；复用同一个字段就不会再对不上。
 
     @field_validator("admin_user_ids", mode="before")
     @classmethod

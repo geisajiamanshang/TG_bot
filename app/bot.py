@@ -1789,6 +1789,13 @@ def build_dispatcher(services: Services) -> Dispatcher:
         if not services.sheets.configured:
             await message.answer("Google 花名册尚未配置，无法查询。")
             return
+        if not services.settings.probation_sync_group_chat_id:
+            await message.answer(
+                "尚未配置 PROBATION_SYNC_GROUP_CHAT_ID，"
+                "请先在 .env 里配置这个群的 chat_id 后再使用本命令"
+                "（/training_notify 发送到的是和 /probation_notify 转正信息同步相同的群）。"
+            )
+            return
         tomorrow = datetime.now(ATTENDANCE_TIMEZONE).date() + timedelta(days=1)
         await message.answer(f"正在只读查询花名册 G 列生效日期为 {tomorrow.isoformat()}（明天）的新人……")
         try:
@@ -1838,7 +1845,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
             await message.answer("本轮预览已失效，请重新执行 /training_notify。")
             return
         try:
-            await bot.send_message(services.settings.training_notify_group_chat_id, training_text)
+            await bot.send_message(services.settings.probation_sync_group_chat_id, training_text)
         except Exception as exc:
             logger.exception("Training notify send failed")
             await message.answer(f"发送【次日培训信息同步】到群失败：{str(exc)[:160]}")
