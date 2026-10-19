@@ -170,6 +170,11 @@ class SupervisorNotify(StatesGroup):
 
 class OnboardingNotify(StatesGroup):
     waiting_for_confirmation = State()
+    # 发送到群之前，管理员可以先修改【新人入职通知】/【入职信息同步】的内容（整段替换，不是
+    # 增量编辑）。waiting_for_edit_choice 等管理员选要改哪一段，waiting_for_edit_text 等管理员
+    # 发来替换后的新内容。
+    waiting_for_edit_choice = State()
+    waiting_for_edit_text = State()
 
 
 class ProbationNotify(StatesGroup):
@@ -1570,15 +1575,24 @@ def build_dispatcher(services: Services) -> Dispatcher:
             onboarding_notice_text=notice_text,
             onboarding_sync_text=sync_text,
             onboarding_candidates=candidates,
+            onboarding_names=names,
+            onboarding_preview_message_ids=[],
         )
+        await _onboarding_send_preview(message, state, notice_text, sync_text, names)
 
+    async def _onboarding_send_preview(
+        message: Message, state: FSMContext, notice_text: str, sync_text: str, names: str
+    ) -> None:
+        candidate_count = names.count("、") + 1 if names else 0
         preview = (
-            f"今日入职 {len(candidates)} 人：{names}\n\n"
+            f"今日入职 {candidate_count} 人：{names}\n\n"
             f"———【新人入职通知】预览（将发到恒睿公司-联合管理工作群）———\n\n{notice_text}\n\n"
             f"———【入职信息同步】预览（下午随机 15:15-18:00 之间发到人事数据同步-SSC3组）———\n\n{sync_text}\n\n"
-            "回复 1 确认发送；回复 /cancel 取消本轮。"
+            "回复 1 确认发送（发送后还会自动生成并私信入职协议）；回复 编辑 可以在发送前修改"
+            "【新人入职通知】或【入职信息同步】的内容；回复 /cancel 取消本轮。"
         )
-        preview_message_ids: list[int] = []
+        data = await state.get_data()
+        preview_message_ids = [int(v) for v in data.get("onboarding_preview_message_ids") or []]
         for start in range(0, len(preview), 3700):
             sent = await message.answer(preview[start:start + 3700])
             preview_message_ids.append(sent.message_id)
@@ -1592,8 +1606,15 @@ def build_dispatcher(services: Services) -> Dispatcher:
         text = (message.text or "").strip()
         if text.casefold().startswith("/cancel"):
             return  # 交给全局 /cancel 命令处理
+        if text == "编辑":
+            await state.set_state(OnboardingNotify.waiting_for_edit_choice)
+            await message.answer(
+                "要修改哪一段？回复 1 修改【新人入职通知】；回复 2 修改【入职信息同步】；"
+                "回复 0 不改了，返回上一步；回复 /cancel 取消本轮。"
+            )
+            return
         if text != "1":
-            await message.answer("回复 1 确认发送到群；或回复 /cancel 取消本轮。")
+            await message.answer("回复 1 确认发送到群；回复 编辑 可以先修改内容；或回复 /cancel 取消本轮。")
             return
 
         data = await state.get_data()
@@ -1668,6 +1689,57 @@ def build_dispatcher(services: Services) -> Dispatcher:
         if existing and not existing.done():
             existing.cancel()
         services.onboarding_sync_tasks[admin_id] = asyncio.create_task(_send_sync_later())
+
+    @router.message(OnboardingNotify.waiting_for_edit_choice, F.text)
+    async def onboarding_notify_edit_choice(message: Message, state: FSMContext) -> None:
+        if not message.from_user or not _is_admin(message.from_user.id, services.settings):
+            await state.clear()
+            return
+        text = (message.text or "").strip()
+        if text.casefold().startswith("/cancel"):
+            return  # 交给全局 /cancel 命令处理
+        if text == "0":
+            data = await state.get_data()
+            await state.set_state(OnboardingNotify.waiting_for_confirmation)
+            await _onboarding_send_preview(
+                message, state,
+                str(data.get("onboarding_notice_text") or ""),
+                str(data.get("onboarding_sync_text") or ""),
+                str(data.get("onboarding_names") or ""),
+            )
+            return
+        if text not in {"1", "2"}:
+            await message.answer("回复 1 修改【新人入职通知】；回复 2 修改【入职信息同步】；回复 0 返回；或回复 /cancel 取消本轮。")
+            return
+        await state.update_data(onboarding_edit_target="notice" if text == "1" else "sync")
+        await state.set_state(OnboardingNotify.waiting_for_edit_text)
+        label = "【新人入职通知】" if text == "1" else "【入职信息同步】"
+        await message.answer(f"请发送 {label} 的新内容（整段替换，不是在原文上增量修改）。")
+
+    @router.message(OnboardingNotify.waiting_for_edit_text, F.text)
+    async def onboarding_notify_edit_text(message: Message, state: FSMContext) -> None:
+        if not message.from_user or not _is_admin(message.from_user.id, services.settings):
+            await state.clear()
+            return
+        text = message.text or ""
+        if text.strip().casefold().startswith("/cancel"):
+            return  # 交给全局 /cancel 命令处理
+        data = await state.get_data()
+        target = data.get("onboarding_edit_target")
+        notice_text = str(data.get("onboarding_notice_text") or "")
+        sync_text = str(data.get("onboarding_sync_text") or "")
+        if target == "notice":
+            notice_text = text
+        elif target == "sync":
+            sync_text = text
+        else:
+            await message.answer("本轮编辑状态已失效，请重新执行 /onboarding_notify。")
+            await state.clear()
+            return
+        await state.update_data(onboarding_notice_text=notice_text, onboarding_sync_text=sync_text)
+        await state.set_state(OnboardingNotify.waiting_for_confirmation)
+        await message.answer("已更新，预览如下：")
+        await _onboarding_send_preview(message, state, notice_text, sync_text, str(data.get("onboarding_names") or ""))
 
     @router.message(Command("probation_notify"))
     async def probation_notify_start(message: Message, state: FSMContext, bot: Bot) -> None:
