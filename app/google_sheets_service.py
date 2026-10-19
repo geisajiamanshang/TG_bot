@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import re
 import logging
@@ -11,6 +12,7 @@ from threading import Lock
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
 from app.employee_profile import DISPLAY_LABELS, person_name_keys
 from app.hr_defaults import normalize_department, default_office_region
@@ -193,11 +195,13 @@ class GoogleSheetsService:
         return build("sheets", "v4", credentials=credentials, cache_discovery=False)
 
     def _drive_service(self):
-        """只读 Drive 客户端，用于 /probation_notify 按花名在指定文件夹里找转正海报。
-        服务账号需要额外被授予该 Drive 文件夹的"查看者"权限。"""
+        """Drive 客户端：/probation_notify 用来按花名在指定文件夹里找转正海报/表单（只读），
+        入职协议功能还要用它往"入职协议"文件夹里新建月份子文件夹、上传协议文件（需要写权限），
+        所以这里用的是完整的 drive scope，不是 drive.readonly。服务账号需要额外被授予相应 Drive
+        文件夹的权限——只读用途（海报/表单）"查看者"就够，入职协议文件夹需要"编辑者"。"""
         credentials = Credentials.from_service_account_file(
             self.credentials_file,
-            scopes=["https://www.googleapis.com/auth/drive.readonly"],
+            scopes=["https://www.googleapis.com/auth/drive"],
         )
         return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
@@ -396,6 +400,8 @@ class GoogleSheetsService:
             "work_tg": idx(ROSTER_COLUMNS["work_tg"]),                   # AE 工作TG
             "private_contact": idx(ROSTER_COLUMNS["private_contact"]),   # AF 私人TG
             "work_email": idx(ROSTER_COLUMNS["work_email"]),             # AG 工作Gmail
+            "trial_salary": idx(EXTRA_SALARY_COLUMNS["trial_salary"]),       # AK 试用期薪资
+            "confirmed_salary": idx(EXTRA_SALARY_COLUMNS["confirmed_salary"]),  # AL 转正薪资
             "hire_date": idx(HIRE_DATE_COLUMN),                          # AR 入职日期
         }
 
@@ -572,6 +578,66 @@ class GoogleSheetsService:
         exact = [f for f in files if Path(f["name"]).stem.strip() == chinese_name]
         chosen = exact[0] if exact else files[0]
         return chosen.get("webViewLink") or f"https://drive.google.com/file/d/{chosen['id']}/view"
+
+    async def upload_onboarding_agreement(
+        self, root_folder_id: str, month_folder: str, filename: str, content: bytes
+    ) -> str:
+        """把填好的入职协议上传到 "<root_folder_id>/<month_folder>" 下（月份子文件夹不存在
+        就自动新建），文件设成"知道链接的人可查看"，返回可分享链接。服务账号需要已经被共享
+        该根文件夹的【编辑者】权限，否则这里会抛出 HttpError。"""
+        return await asyncio.to_thread(
+            self._upload_onboarding_agreement, root_folder_id, month_folder, filename, content
+        )
+
+    def _upload_onboarding_agreement(
+        self, root_folder_id: str, month_folder: str, filename: str, content: bytes
+    ) -> str:
+        drive = self._drive_service()
+        safe_folder = month_folder.replace("'", "\\'")
+        folder_query = (
+            f"'{root_folder_id}' in parents and trashed = false "
+            f"and mimeType = 'application/vnd.google-apps.folder' and name = '{safe_folder}'"
+        )
+        folder_response = drive.files().list(
+            q=folder_query, fields="files(id, name)", pageSize=10,
+            supportsAllDrives=True, includeItemsFromAllDrives=True,
+        ).execute()
+        existing_folders = folder_response.get("files", [])
+        if existing_folders:
+            subfolder_id = existing_folders[0]["id"]
+        else:
+            created_folder = drive.files().create(
+                body={
+                    "name": month_folder,
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [root_folder_id],
+                },
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
+            subfolder_id = created_folder["id"]
+
+        media = MediaIoBaseUpload(
+            io.BytesIO(content),
+            mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            resumable=False,
+        )
+        uploaded = drive.files().create(
+            body={"name": filename, "parents": [subfolder_id]},
+            media_body=media,
+            fields="id, webViewLink",
+            supportsAllDrives=True,
+        ).execute()
+        file_id = uploaded["id"]
+        try:
+            drive.permissions().create(
+                fileId=file_id,
+                body={"role": "reader", "type": "anyone"},
+                supportsAllDrives=True,
+            ).execute()
+        except Exception:
+            logger.exception("Failed to set anyone-with-link permission for uploaded agreement %s", file_id)
+        return uploaded.get("webViewLink") or f"https://drive.google.com/file/d/{file_id}/view"
 
     def _today_hires(self, today: date) -> list[dict[str, str]]:
         service = self._service()

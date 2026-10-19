@@ -26,6 +26,16 @@ HRBP_MAPPING: list[tuple[tuple[str, ...], str]] = [
 # empty after GPT extraction + reference-fill. Keys are the same style of
 # logical field name used elsewhere (see EXTRA_ORG_COLUMNS / EXTRA_HR_DEFAULT_COLUMNS
 # in google_sheets_service.py for the column-letter mapping).
+# 2026-10-19 新增：收到"入职信息确认"（或同一触发条件下的"新人入职"/"中文花名"）时，这些
+# 花名册字段（ROSTER_COLUMNS 里的字段，不是 EXTRA_ORG_COLUMNS）如果本人没填，就统一套用这些
+# 固定默认值。国籍/办公地区/在职状态有各自单独的归一化逻辑，不在这里重复。
+NEW_HIRE_VALUE_DEFAULTS: dict[str, str] = {
+    "gender": "男",          # 性别
+    "age_range": "31-35",    # 年龄区间
+    "education": "本科",      # 学历
+    "birthday_month": "3月",  # 生日月份
+}
+
 NEW_HIRE_STATIC_DEFAULTS: dict[str, str] = {
     "job_sequence": "派驻",       # 序列
     "service_entity": "恒睿",     # 服务单位
@@ -89,10 +99,11 @@ def default_nationality(value: str) -> str:
 
 
 def default_office_region(value: str) -> str:
+    # 2026-10-19 更新：办公地区"中国/其他国家"口径下，国内一律写"中国"（不再是"中国大陆"）。
     text = normalize_region_like(value)
     compact = text.replace(" ", "")
     if not compact or compact in {"中国", "国内", "中国境内", "大陆", "中国大陆"}:
-        return "中国大陆"
+        return "中国"
     return text
 
 

@@ -44,6 +44,7 @@ from app.google_sheets_service import GoogleSheetsService, parse_sheet_date
 from app.gpt_service import GPTService
 from app.vision_service import VisionService
 from app import hr_defaults
+from app.onboarding_agreement import agreement_filename, build_onboarding_agreement, month_folder_name
 
 logger = logging.getLogger(__name__)
 ATTENDANCE_TIMEZONE = ZoneInfo("Asia/Shanghai")
@@ -172,8 +173,21 @@ class OnboardingNotify(StatesGroup):
 
 
 class ProbationNotify(StatesGroup):
-    # 1/2/2.1/3 可以按任意顺序、各自独立地回复，所以用同一个 state 一直等，直到 /cancel。
+    # 1/2/2.1/2.2/3 可以按任意顺序、各自独立地回复，所以用同一个 state 一直等，直到 /cancel。
     waiting_for_action = State()
+
+
+class EditSentMessage(StatesGroup):
+    # 入职通知/入职信息同步/转正提醒/转正通知/转正信息同步 发到群之后，管理员点"✏️ 编辑这条消息"
+    # 按钮进入这个状态，回复新内容就用 bot 自己的身份把群里那条消息编辑掉（普通用户改不了机器人发的
+    # 消息，只有机器人自己能编辑）。
+    waiting_for_new_text = State()
+
+
+def _edit_sent_button(chat_id: int, message_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✏️ 编辑这条消息", callback_data=f"editsent:{chat_id}:{message_id}")
+    ]])
 
 
 def build_supervisor_groups(
@@ -240,15 +254,19 @@ ONBOARDING_SUPERVISOR_HANDLES = frozenset(
 ONBOARDING_HRBP_HANDLES = frozenset({"FWN066", "feang99568", "kcin895"})
 
 # (部门, 小组) 精确匹配优先于按部门匹配。
+# 注意：这里的 linerkang 就是 linerkang，不是 haohaoganhuoshaodapao —— 之前因为"直接/间接
+# 上级"名单里出现了 haohaoganhuoshaodapao 这个没见过的 handle，错误地把这里的 linerkang 当成
+# 被替换掉了，实际上两者是完全不相关的两个人，haohaoganhuoshaodapao 只在 /probation_notify
+# 的渠道拓展部/传统销售部规则里出现（那是按模版原文来的，没有问题）。
 ONBOARDING_TEAM_MENTIONS: dict[tuple[str, str], tuple[str, ...]] = {
-    ("ACFAN特战队", "内容组"): ("haohaoganhuoshaodapao", "wean4790"),
-    ("ACFAN特战队", "SEO组"): ("haohaoganhuoshaodapao", "wean4790"),
+    ("ACFAN特战队", "内容组"): ("linerkang", "wean4790"),
+    ("ACFAN特战队", "SEO组"): ("linerkang", "wean4790"),
     ("研发部", "前端组"): ("wdz999", "feang99568", "kcin895"),
     ("研发部", "后端组"): ("liyuanba666", "feang99568", "kcin895"),
 }
 ONBOARDING_DEPARTMENT_MENTIONS: dict[str, tuple[str, ...]] = {
-    "效能部": ("haohaoganhuoshaodapao", "wean4790"),
-    "AIGC原创部": ("haohaoganhuoshaodapao", "wean4790"),
+    "效能部": ("linerkang", "wean4790"),
+    "AIGC原创部": ("linerkang", "wean4790"),
     "运营一部": ("FWN066", "zlei1216"),
     "运营二部": ("xxs202215cz2025", "wean4790"),
     # 其他未命中具体小组规则的 ACFAN特战队。
@@ -569,6 +587,52 @@ def build_probation_sync(candidates: list[dict[str, str]]) -> str:
     return f"【转正信息同步】\n\n{body}"
 
 
+async def _send_onboarding_agreements(
+    bot: Bot, chat_id: int, candidates: list[dict[str, str]], services: "Services"
+) -> None:
+    """【新人入职通知】确认发送之后，逐人生成远程员工入职协议书、上传到 Drive 入职协议文件夹
+    （按月份子文件夹存放，没有就自动新建），再把链接私信发给员工本人的私人TG，并附带
+    '需要签字哦'。单人失败不影响其他人；最后给管理员发一条成功/失败汇总。"""
+    settings = services.settings
+    successful: list[str] = []
+    failed: list[str] = []
+    for candidate in candidates:
+        name = str(candidate.get("chinese_name") or "")
+        private_tg = str(candidate.get("private_contact") or "").strip().lstrip("@")
+        if not private_tg:
+            failed.append(f"{name}（花名册 AF 列没有私人TG）")
+            continue
+        try:
+            content = build_onboarding_agreement(candidate)
+            filename = agreement_filename(candidate)
+            folder = month_folder_name(
+                str(candidate.get("effective_date") or candidate.get("hire_date") or "")
+            )
+            link = await services.sheets.upload_onboarding_agreement(
+                settings.onboarding_agreement_drive_folder_id, folder, filename, content
+            )
+        except Exception as exc:
+            logger.exception("Onboarding agreement generate/upload failed for %s", name)
+            failed.append(f"{name}（生成/上传入职协议失败：{str(exc)[:80]}）")
+            continue
+        try:
+            target_chat = await bot.get_chat(f"@{private_tg}")
+            await bot.send_message(target_chat.id, f"{link}\n\n需要签字哦")
+            successful.append(name)
+        except Exception as exc:
+            logger.exception("Onboarding agreement DM failed for %s", name)
+            failed.append(f"{name}（协议已生成，但私信 @{private_tg} 失败：{str(exc)[:80]}；链接：{link}）")
+    lines = [f"【入职协议】处理完成。成功：{len(successful)}，失败：{len(failed)}"]
+    if successful:
+        lines.append("✅ " + "、".join(successful))
+    if failed:
+        lines.append("❌ " + "\n".join(failed))
+    try:
+        await bot.send_message(chat_id, "\n".join(lines)[:3900])
+    except Exception:
+        logger.exception("Failed to send onboarding agreement summary to admin")
+
+
 async def run_probation_notify(bot: Bot, chat_id: int, state: FSMContext, services: "Services") -> None:
     """查花名册 BK 列生成 /probation_notify 预览并写入 FSM state。供手动命令和
     周一到周六 10:00 的定时任务共用（定时任务没有 Message，所以不依赖它）。"""
@@ -720,6 +784,12 @@ def _apply_new_hire_defaults(
     values["nationality"] = hr_defaults.default_nationality(values.get("nationality", ""))
     values["office_region"] = hr_defaults.default_office_region(values.get("office_region", ""))
     values.setdefault("employment_status", "试用期")
+    # 2026-10-19 用户要求：收到"入职信息确认"（或同一触发条件下的"新人入职"/"中文花名"）时，
+    # 以下几个字段如果本人没填，就统一套用固定默认值；工作TG 没填就直接沿用私人TG。
+    for key, default_value in hr_defaults.NEW_HIRE_VALUE_DEFAULTS.items():
+        values.setdefault(key, default_value)
+    if not values.get("work_tg") and values.get("private_contact"):
+        values["work_tg"] = values["private_contact"]
     for key, default_value in hr_defaults.NEW_HIRE_STATIC_DEFAULTS.items():
         extra_fields.setdefault(key, default_value)
     hr_defaults.apply_org_specific_defaults(extra_fields, org_hint)
@@ -1099,6 +1169,63 @@ def build_dispatcher(services: Services) -> Dispatcher:
                 probation_task.cancel()
         await message.answer("操作已取消。")
 
+    @router.callback_query(F.data.startswith("editsent:"))
+    async def edit_sent_message_start(callback: CallbackQuery, state: FSMContext) -> None:
+        if not callback.from_user or not _is_admin(callback.from_user.id, services.settings):
+            await callback.answer("无权操作", show_alert=True)
+            return
+        parts = (callback.data or "").split(":", 2)
+        if len(parts) != 3:
+            await callback.answer("按钮数据已失效", show_alert=True)
+            return
+        try:
+            target_chat_id = int(parts[1])
+            target_message_id = int(parts[2])
+        except ValueError:
+            await callback.answer("按钮数据已失效", show_alert=True)
+            return
+        await state.set_state(EditSentMessage.waiting_for_new_text)
+        await state.update_data(
+            edit_target_chat_id=target_chat_id, edit_target_message_id=target_message_id
+        )
+        if callback.message:
+            await callback.message.answer(
+                "请回复要替换成的完整内容（会直接覆盖掉群里刚才那条消息）；回复 /cancel 取消。"
+            )
+        await callback.answer()
+
+    @router.message(EditSentMessage.waiting_for_new_text, F.text)
+    async def edit_sent_message_apply(message: Message, state: FSMContext, bot: Bot) -> None:
+        if not message.from_user or not _is_admin(message.from_user.id, services.settings):
+            await state.clear()
+            return
+        text = (message.text or "").strip()
+        if text.casefold().startswith("/cancel"):
+            return  # 交给全局 /cancel 命令处理
+        data = await state.get_data()
+        target_chat_id = data.get("edit_target_chat_id")
+        target_message_id = data.get("edit_target_message_id")
+        await state.clear()
+        if target_chat_id is None or target_message_id is None:
+            await message.answer("本次编辑已失效，请重新点击要编辑的消息下面的按钮。")
+            return
+        try:
+            await bot.edit_message_text(text, chat_id=target_chat_id, message_id=target_message_id)
+        except TelegramBadRequest:
+            try:
+                await bot.edit_message_caption(
+                    chat_id=target_chat_id, message_id=target_message_id, caption=text
+                )
+            except Exception as exc:
+                logger.exception("Edit sent message (caption) failed")
+                await message.answer(f"编辑失败：{str(exc)[:160]}")
+                return
+        except Exception as exc:
+            logger.exception("Edit sent message failed")
+            await message.answer(f"编辑失败：{str(exc)[:160]}")
+            return
+        await message.answer("✅ 已更新那条消息。")
+
     @router.message(Command("stats"))
     async def stats(message: Message) -> None:
         if not message.from_user or not _is_admin(message.from_user.id, services.settings):
@@ -1441,6 +1568,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
         await state.update_data(
             onboarding_notice_text=notice_text,
             onboarding_sync_text=sync_text,
+            onboarding_candidates=candidates,
         )
 
         preview = (
@@ -1470,6 +1598,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
         data = await state.get_data()
         notice_text = str(data.get("onboarding_notice_text") or "")
         sync_text = str(data.get("onboarding_sync_text") or "")
+        candidates: list[dict[str, str]] = data.get("onboarding_candidates") or []
         preview_message_ids = [int(value) for value in data.get("onboarding_preview_message_ids") or []]
         admin_id = message.from_user.id
         chat_id = message.chat.id
@@ -1482,14 +1611,20 @@ def build_dispatcher(services: Services) -> Dispatcher:
             return
 
         try:
-            await bot.send_message(notify_chat_id, notice_text)
+            notice_sent = await bot.send_message(notify_chat_id, notice_text)
         except Exception as exc:
             logger.exception("Onboarding notice send failed")
             await message.answer(
                 f"发送【新人入职通知】到群失败：{str(exc)[:160]}；本轮已终止，下午的入职信息同步也不会发送。"
             )
             return
-        await message.answer("✅ 【新人入职通知】已发送到恒睿公司-联合管理工作群。")
+        await message.answer(
+            "✅ 【新人入职通知】已发送到恒睿公司-联合管理工作群。",
+            reply_markup=_edit_sent_button(notify_chat_id, notice_sent.message_id),
+        )
+
+        if candidates:
+            await _send_onboarding_agreements(bot, chat_id, candidates, services)
 
         now = datetime.now(ATTENDANCE_TIMEZONE)
         window_start = now.replace(hour=15, minute=15, second=0, microsecond=0)
@@ -1507,8 +1642,11 @@ def build_dispatcher(services: Services) -> Dispatcher:
             try:
                 delay = max(0.0, (target - datetime.now(ATTENDANCE_TIMEZONE)).total_seconds())
                 await asyncio.sleep(delay)
-                await bot.send_message(sync_chat_id, sync_text)
-                await bot.send_message(chat_id, "✅ 【入职信息同步】已发送到人事数据同步-SSC3组。本轮入职通知转发完成。")
+                sync_sent = await bot.send_message(sync_chat_id, sync_text)
+                await bot.send_message(
+                    chat_id, "✅ 【入职信息同步】已发送到人事数据同步-SSC3组。本轮入职通知转发完成。",
+                    reply_markup=_edit_sent_button(sync_chat_id, sync_sent.message_id),
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1587,12 +1725,15 @@ def build_dispatcher(services: Services) -> Dispatcher:
                 await message.answer("没有需要发送的【新人预转正提醒】。")
                 return
             try:
-                await bot.send_message(settings.probation_union_group_chat_id, reminder_text)
+                reminder_sent = await bot.send_message(settings.probation_union_group_chat_id, reminder_text)
             except Exception as exc:
                 logger.exception("Probation reminder send failed")
                 await message.answer(f"发送【新人预转正提醒】到群失败：{str(exc)[:160]}")
                 return
-            await message.answer("✅ 【新人预转正提醒】已发送到恒睿公司-联合管理群。")
+            await message.answer(
+                "✅ 【新人预转正提醒】已发送到恒睿公司-联合管理群。",
+                reply_markup=_edit_sent_button(settings.probation_union_group_chat_id, reminder_sent.message_id),
+            )
             await _probation_mark_done_and_maybe_cleanup(state, bot, chat_id, "1")
             return
 
@@ -1605,16 +1746,25 @@ def build_dispatcher(services: Services) -> Dispatcher:
                 form_link = await _probation_resolve_form_link(services, candidate)
                 blocks.append(_build_probation_application_block(candidate, form_link))
             application_text = "\n\n———\n\n".join(blocks)
+            last_sent = None
             try:
                 for start in range(0, len(application_text), 3900):
-                    await bot.send_message(
+                    last_sent = await bot.send_message(
                         settings.probation_union_group_chat_id, application_text[start:start + 3900]
                     )
             except Exception as exc:
                 logger.exception("Probation application group send failed")
                 await message.answer(f"发送【试用期转正申请】到群失败：{str(exc)[:160]}")
                 return
-            await message.answer("✅ 【试用期转正申请】已发送到恒睿公司-联合管理群。")
+            reply_markup = (
+                _edit_sent_button(settings.probation_union_group_chat_id, last_sent.message_id)
+                if last_sent else None
+            )
+            await message.answer(
+                "✅ 【试用期转正申请】已发送到恒睿公司-联合管理群。"
+                + ("（内容太长分了多条，编辑按钮只对应最后一条）" if last_sent and len(application_text) > 3900 else ""),
+                reply_markup=reply_markup,
+            )
             await _probation_mark_done_and_maybe_cleanup(state, bot, chat_id, "2.2")
             return
 
@@ -1673,6 +1823,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
             return
         successful = []
         failed = []
+        sent_refs: list[tuple[str, int, int]] = []  # (花名, chat_id, message_id)，用来挂编辑按钮
         for index, candidate in enumerate(due):
             if index > 0:
                 # 多人连续发转正海报到全员群时，每次发送间随机间隔 30 秒 - 1 分钟。
@@ -1694,14 +1845,15 @@ def build_dispatcher(services: Services) -> Dispatcher:
             try:
                 if poster:
                     content, _mime = poster
-                    await bot.send_photo(
+                    sent = await bot.send_photo(
                         target_chat_id,
                         BufferedInputFile(content, filename=f"{name}.jpg"),
                         caption=notice_text,
                     )
                 else:
-                    await bot.send_message(target_chat_id, notice_text)
+                    sent = await bot.send_message(target_chat_id, notice_text)
                 successful.append(name)
+                sent_refs.append((name, target_chat_id, sent.message_id))
             except Exception as exc:
                 logger.exception("Probation notice send failed for %s", name)
                 failed.append(f"{name}（{str(exc)[:80]}）")
@@ -1710,7 +1862,14 @@ def build_dispatcher(services: Services) -> Dispatcher:
             lines.append("✅ " + "、".join(successful))
         if failed:
             lines.append("❌ " + "\n".join(failed))
-        await message.answer("\n".join(lines)[:3900])
+        edit_buttons = [
+            [InlineKeyboardButton(text=f"✏️ 编辑 {name}", callback_data=f"editsent:{chat_id_}:{message_id_}")]
+            for name, chat_id_, message_id_ in sent_refs
+        ]
+        await message.answer(
+            "\n".join(lines)[:3900],
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=edit_buttons) if edit_buttons else None,
+        )
 
         if not sync_text:
             await _probation_mark_done_and_maybe_cleanup(state, bot, chat_id, "3")
@@ -1733,8 +1892,11 @@ def build_dispatcher(services: Services) -> Dispatcher:
             try:
                 delay = max(0.0, (target - datetime.now(ATTENDANCE_TIMEZONE)).total_seconds())
                 await asyncio.sleep(delay)
-                await bot.send_message(sync_chat_id, sync_text)
-                await bot.send_message(chat_id, "✅ 【转正信息同步】已发送到人事数据同步-SSC3组。")
+                probation_sync_sent = await bot.send_message(sync_chat_id, sync_text)
+                await bot.send_message(
+                    chat_id, "✅ 【转正信息同步】已发送到人事数据同步-SSC3组。",
+                    reply_markup=_edit_sent_button(sync_chat_id, probation_sync_sent.message_id),
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:
