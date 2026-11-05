@@ -159,6 +159,15 @@ class Database:
                     content TEXT NOT NULL,
                     sent_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS employee_code_assignments (
+                    code TEXT PRIMARY KEY,
+                    prefix TEXT NOT NULL,
+                    recipient_telegram_id INTEGER,
+                    recipient_name TEXT NOT NULL,
+                    allocated_by_admin INTEGER,
+                    source TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_outbound_user_template
                     ON outbound_messages (telegram_user_id, template_name, sent_at);
                 CREATE INDEX IF NOT EXISTS idx_attendance_user_date
@@ -865,6 +874,45 @@ class Database:
             await db.execute(
                 "UPDATE feedback SET helpful = ? WHERE id = ?",
                 (int(helpful), feedback_id),
+            )
+            await db.commit()
+
+
+    async def employee_codes_used(self) -> set[str]:
+        async with aiosqlite.connect(self.path) as db:
+            rows = await (await db.execute(
+                "SELECT code FROM employee_code_assignments"
+            )).fetchall()
+        return {str(row[0]).strip().upper() for row in rows}
+
+    async def record_employee_code_assignments(
+        self,
+        assignments: list[dict[str, object]],
+    ) -> None:
+        if not assignments:
+            return
+        now = datetime.now(UTC).isoformat()
+        async with aiosqlite.connect(self.path) as db:
+            await db.executemany(
+                """
+                INSERT INTO employee_code_assignments
+                    (code, prefix, recipient_telegram_id, recipient_name,
+                     allocated_by_admin, source, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(code) DO NOTHING
+                """,
+                [
+                    (
+                        str(item["code"]).upper(),
+                        str(item["prefix"]).upper(),
+                        item.get("recipient_telegram_id"),
+                        str(item.get("recipient_name") or ""),
+                        item.get("allocated_by_admin"),
+                        str(item.get("source") or "manual"),
+                        now,
+                    )
+                    for item in assignments
+                ],
             )
             await db.commit()
 

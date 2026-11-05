@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import re
+import random
 import logging
 from collections import Counter
 from datetime import date, datetime, timedelta
@@ -15,6 +16,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
 from app.employee_profile import DISPLAY_LABELS, person_name_keys
+from app.employee_code_pool import CODE_PREFIXES, EMPLOYEE_CODE_POOL_MARKER, EMPLOYEE_CODE_POOL_SHEET
 from app.hr_defaults import normalize_department, default_office_region
 
 logger = logging.getLogger(__name__)
@@ -140,6 +142,7 @@ class GoogleSheetsService:
         # Prevent two Telegram updates from passing the new-hire dedupe check at
         # the same time and both appending an onboarding record.
         self._change_lock = Lock()
+        self._employee_code_lock = Lock()
 
     @property
     def configured(self) -> bool:
@@ -261,6 +264,199 @@ class GoogleSheetsService:
             spreadsheetId=spreadsheet_id or self.spreadsheet_id, range=f"'{sheet}'!{range_}"
         ).execute()
         return result.get("values", [])
+
+
+    async def find_new_hire_for_employee_code(
+        self, telegram_username: str | None, today: date
+    ) -> dict[str, str] | None:
+        """Match a new Telegram username against AE/AF and return a future hire from AR."""
+        if not telegram_username:
+            return None
+        return await asyncio.to_thread(
+            self._find_new_hire_for_employee_code, telegram_username, today
+        )
+
+    def _find_new_hire_for_employee_code(
+        self, telegram_username: str, today: date
+    ) -> dict[str, str] | None:
+        service = self._service()
+        rows = self._read_rows(service, ROSTER_SHEET, f"A{ROSTER_START_ROW}:{HIRE_DATE_COLUMN}5000")
+
+        def normalized(value: object) -> str:
+            text = str(value or "").strip().casefold()
+            text = re.sub(r"^https?://t\.me/", "", text)
+            return text.lstrip("@").rstrip("/").strip()
+
+        wanted = normalized(telegram_username)
+        if not wanted:
+            return None
+        matches: list[dict[str, str]] = []
+        for row_number, row in enumerate(rows, start=ROSTER_START_ROW):
+            def cell(column: str) -> str:
+                index = self._column_index(column)
+                return str(row[index]).strip() if len(row) > index else ""
+
+            if wanted not in {normalized(cell("AE")), normalized(cell("AF"))}:
+                continue
+            hire_date = parse_sheet_date(cell(HIRE_DATE_COLUMN))
+            if hire_date is None or hire_date < today:
+                continue
+            matches.append({
+                "row": str(row_number),
+                "employee_code": cell("B"),
+                "chinese_name": cell("C"),
+                "org_unit": cell("M"),
+                "hire_date": hire_date.isoformat(),
+            })
+        if not matches:
+            return None
+        if len(matches) > 1:
+            return {
+                "status": "ambiguous",
+                "chinese_name": "、".join(item["chinese_name"] or f"第{item['row']}行" for item in matches),
+                "rows": ",".join(item["row"] for item in matches),
+            }
+        candidate = matches[0]
+        if candidate["employee_code"]:
+            candidate["status"] = "already_has_code"
+            return candidate
+        org_unit = candidate["org_unit"]
+        if "运营中心" in org_unit:
+            candidate["prefix"] = "YY"
+        elif "技术中心" in org_unit:
+            candidate["prefix"] = "DN"
+        elif "效能中心" in org_unit:
+            candidate["prefix"] = "NX"
+        else:
+            candidate["status"] = "unsupported_org"
+            return candidate
+        candidate["status"] = "ready"
+        return candidate
+
+    async def allocate_employee_codes(
+        self, prefix: str, count: int, excluded_codes: set[str] | None = None
+    ) -> list[str]:
+        return await asyncio.to_thread(
+            self._allocate_employee_codes, prefix, count, excluded_codes or set()
+        )
+
+    def _ensure_employee_code_pool(self, service) -> tuple[int, list[list[object]]]:
+        metadata = service.spreadsheets().get(
+            spreadsheetId=self.spreadsheet_id,
+            fields="sheets.properties(sheetId,title)",
+        ).execute()
+        sheet_props = next(
+            (
+                sheet.get("properties", {})
+                for sheet in metadata.get("sheets", [])
+                if sheet.get("properties", {}).get("title") == EMPLOYEE_CODE_POOL_SHEET
+            ),
+            None,
+        )
+        if sheet_props is None:
+            created = service.spreadsheets().batchUpdate(
+                spreadsheetId=self.spreadsheet_id,
+                body={"requests": [{
+                    "addSheet": {
+                        "properties": {
+                            "title": EMPLOYEE_CODE_POOL_SHEET,
+                            "gridProperties": {"rowCount": 1000, "columnCount": 3},
+                        }
+                    }
+                }]},
+            ).execute()
+            sheet_props = created["replies"][0]["addSheet"]["properties"]
+        sheet_id = int(sheet_props["sheetId"])
+        values_api = service.spreadsheets().values()
+        current = values_api.get(
+            spreadsheetId=self.spreadsheet_id,
+            range=f"'{EMPLOYEE_CODE_POOL_SHEET}'!A1:C1000",
+        ).execute().get("values", [])
+        marker = str(current[0][2]).strip() if current and len(current[0]) > 2 else ""
+        if marker != EMPLOYEE_CODE_POOL_MARKER:
+            nonempty = any(str(value).strip() for row in current for value in row)
+            if nonempty:
+                raise ValueError(
+                    "“工号池”工作表已存在但缺少初始化标记；为避免覆盖现有数据，已停止分配。"
+                )
+            values_api.update(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"'{EMPLOYEE_CODE_POOL_SHEET}'!A1:C1",
+                valueInputOption="RAW",
+                body={"values": [["类型", "工号", EMPLOYEE_CODE_POOL_MARKER]]},
+            ).execute()
+            current = [["类型", "工号", EMPLOYEE_CODE_POOL_MARKER]]
+        return sheet_id, current
+
+    def _allocate_employee_codes(
+        self, prefix: str, count: int, excluded_codes: set[str]
+    ) -> list[str]:
+        if prefix not in CODE_PREFIXES:
+            raise ValueError("未知工号类型。")
+        if count < 1:
+            raise ValueError("工号数量必须大于 0。")
+        with self._employee_code_lock:
+            service = self._service()
+            sheet_id, current = self._ensure_employee_code_pool(service)
+            pool: list[tuple[str, str]] = []
+            seen: set[str] = set()
+            for row in current[1:]:
+                kind = str(row[0] if row else "").strip().upper()
+                code = str(row[1] if len(row) > 1 else "").strip().upper()
+                if not kind and not code:
+                    continue
+                if kind not in CODE_PREFIXES or not re.fullmatch(rf"{kind}\d{{4}}", code):
+                    raise ValueError("工号池中存在格式不正确的行，请先检查“工号池”工作表。")
+                if code in seen:
+                    raise ValueError(f"工号池中编号 {code} 重复，已停止分配。")
+                seen.add(code)
+                pool.append((kind, code))
+            available = [
+                code for kind, code in pool
+                if kind == prefix and code not in excluded_codes
+            ]
+            if len(available) < count:
+                raise ValueError(
+                    f"{prefix} 类型当前仅有 {len(available)} 个可用工号，无法分配 {count} 个。"
+                    "请在“工号池”A列填写类型（YY/DN/NX），B列填写工号后重试。"
+                )
+            chosen = random.sample(available, count)
+            chosen_set = set(chosen)
+            remaining = [(kind, code) for kind, code in pool if code not in chosen_set]
+            end_row_index = max(2, len(pool) + 1, len(remaining) + 1)
+            cell_rows = [
+                {"values": [
+                    {"userEnteredValue": {"stringValue": kind}},
+                    {"userEnteredValue": {"stringValue": code}},
+                ]}
+                for kind, code in remaining
+            ]
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=self.spreadsheet_id,
+                body={"requests": [{
+                    "updateCells": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 1,
+                            "endRowIndex": end_row_index,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": 2,
+                        },
+                        "rows": cell_rows,
+                        "fields": "userEnteredValue",
+                    }
+                }]},
+            ).execute()
+            still_present = service.spreadsheets().values().get(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"'{EMPLOYEE_CODE_POOL_SHEET}'!B2:B1000",
+            ).execute().get("values", [])
+            remaining_values = {
+                str(row[0]).strip().upper() for row in still_present if row
+            }
+            if chosen_set & remaining_values:
+                raise RuntimeError("工号池更新后仍发现已抽取编号，未返回编号，请管理员检查表格。")
+            return chosen
 
     async def attendance_contacts(self, chinese_names: list[str]) -> list[dict[str, str]]:
         """Read-only lookup: match 花名册 C 花名 and return AE 工作TG."""
