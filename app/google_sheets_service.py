@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import re
+import random
 import logging
 from collections import Counter
 from datetime import date, datetime, timedelta
@@ -283,7 +284,7 @@ class GoogleSheetsService:
 
         def normalized(value: object) -> str:
             text = str(value or "").strip().casefold()
-            text = re.sub(r"^https?://t\\.me/", "", text)
+            text = re.sub(r"^https?://t\.me/", "", text)
             return text.lstrip("@").rstrip("/").strip()
 
         wanted = normalized(telegram_username)
@@ -404,7 +405,7 @@ class GoogleSheetsService:
                 code = str(row[1] if len(row) > 1 else "").strip().upper()
                 if not kind and not code:
                     continue
-                if kind not in CODE_PREFIXES or not re.fullmatch(rf"{kind}\\d{{4}}", code):
+                if kind not in CODE_PREFIXES or not re.fullmatch(rf"{kind}\d{{4}}", code):
                     raise ValueError("工号池中存在格式不正确的行，请先检查“工号池”工作表。")
                 if code in seen:
                     raise ValueError(f"工号池中编号 {code} 重复，已停止分配。")
