@@ -188,6 +188,11 @@ class TrainingNotify(StatesGroup):
     waiting_for_edit_text = State()
 
 
+class EmployeeCodeAllocation(StatesGroup):
+    waiting_for_count = State()
+    waiting_for_custom_count = State()
+
+
 class EditSentMessage(StatesGroup):
     # 入职通知/入职信息同步/转正提醒/转正通知/转正信息同步 发到群之后，管理员点"✏️ 编辑这条消息"
     # 按钮进入这个状态，回复新内容就用 bot 自己的身份把群里那条消息编辑掉（普通用户改不了机器人发的
@@ -1135,12 +1140,122 @@ def _sheet_error_reason(exc: Exception) -> str:
     return text[:300] or exc.__class__.__name__
 
 
+
+async def _allocate_manual_employee_codes(
+    event: Message | CallbackQuery,
+    state: FSMContext,
+    count: int,
+    services: Services,
+) -> None:
+    actor = event.from_user
+    if not actor or not _is_admin(actor.id, services.settings):
+        await state.clear()
+        return
+    data = await state.get_data()
+    prefix = str(data.get("employee_code_prefix") or "")
+    if prefix not in {"YY", "DN", "NX"}:
+        await state.clear()
+        target = event.message if isinstance(event, CallbackQuery) else event
+        if target:
+            await target.answer("本次操作已失效，请重新执行 /employee_codes。")
+        return
+    await state.clear()
+    target = event.message if isinstance(event, CallbackQuery) else event
+    if not target:
+        return
+    try:
+        used = await services.db.employee_codes_used()
+        codes = await services.sheets.allocate_employee_codes(prefix, count, used)
+        await services.db.record_employee_code_assignments([
+            {
+                "code": code,
+                "prefix": prefix,
+                "recipient_name": f"管理员 {actor.full_name}",
+                "allocated_by_admin": actor.id,
+                "source": "manual",
+            }
+            for code in codes
+        ])
+    except Exception as exc:
+        logger.exception("Manual employee-code allocation failed")
+        await target.answer(f"工号抽取失败：{str(exc)[:250]}")
+        return
+    await target.answer(f"已抽取 {len(codes)} 个 {prefix} 工号（已从工号池移除）：\n" + "\n".join(codes))
+
 def build_dispatcher(services: Services) -> Dispatcher:
     router = Router()
     dp = Dispatcher()
 
+
+    async def notify_employee_code_admins(bot: Bot, text: str) -> None:
+        for admin_id in services.settings.admin_user_ids:
+            try:
+                await bot.send_message(admin_id, text)
+            except Exception:
+                logger.exception("Failed to notify admin %s about employee-code allocation", admin_id)
+
+    async def assign_employee_code_to_new_follower(message: Message, bot: Bot) -> None:
+        if not message.from_user or not message.from_user.username or not services.sheets.configured:
+            return
+        today = datetime.now(ATTENDANCE_TIMEZONE).date()
+        try:
+            candidate = await services.sheets.find_new_hire_for_employee_code(
+                message.from_user.username, today
+            )
+            if not candidate:
+                return
+            status = candidate.get("status")
+            if status == "ambiguous":
+                await notify_employee_code_admins(
+                    bot,
+                    f"⚠️ 新人关注后匹配到多条未来入职记录，未自动分配工号。"
+                    f"\nTelegram：@{message.from_user.username}（ID {message.from_user.id}）"
+                    f"\n匹配行：{candidate.get('rows')}",
+                )
+                return
+            if status == "already_has_code":
+                await notify_employee_code_admins(
+                    bot,
+                    f"ℹ️ {candidate.get('chinese_name') or message.from_user.full_name} "
+                    f"的花名册已有工号 {candidate.get('employee_code')}，未重复分配。",
+                )
+                return
+            if status != "ready":
+                await notify_employee_code_admins(
+                    bot,
+                    f"⚠️ {candidate.get('chinese_name') or message.from_user.full_name} "
+                    f"符合未来入职日期，但编制组织“{candidate.get('org_unit')}”无法映射到工号类型，未自动分配。",
+                )
+                return
+            prefix = candidate["prefix"]
+            used = await services.db.employee_codes_used()
+            allocated = await services.sheets.allocate_employee_codes(prefix, 1, used)
+            code = allocated[0]
+            await services.db.record_employee_code_assignments([{
+                "code": code,
+                "prefix": prefix,
+                "recipient_telegram_id": message.from_user.id,
+                "recipient_name": candidate.get("chinese_name") or message.from_user.full_name,
+                "source": "new_follower",
+            }])
+            await message.answer(f"你的工号是{code}")
+            await notify_employee_code_admins(
+                bot,
+                f"✅ 新人已自动分配工号"
+                f"\n姓名：{candidate.get('chinese_name') or message.from_user.full_name}"
+                f"\nTelegram：@{message.from_user.username}（ID {message.from_user.id}）"
+                f"\n编制组织：{candidate.get('org_unit')}"
+                f"\n工号：{code}",
+            )
+        except Exception as exc:
+            logger.exception("New-follower employee-code allocation failed")
+            await notify_employee_code_admins(
+                bot,
+                f"⚠️ 新人 {message.from_user.full_name}（@{message.from_user.username}）自动分配工号失败：{str(exc)[:250]}",
+            )
+
     @router.message(CommandStart())
-    async def start(message: Message, state: FSMContext) -> None:
+    async def start(message: Message, state: FSMContext, bot: Bot) -> None:
         if not message.from_user or message.chat.type != ChatType.PRIVATE:
             return
         was_active = await services.db.is_active_employee(message.from_user.id)
@@ -1158,6 +1273,7 @@ def build_dispatcher(services: Services) -> Dispatcher:
             "\n/profile 查看我的员工档案"
         )
         if not was_active:
+            await assign_employee_code_to_new_follower(message, bot)
             for _, template_name, content, _ in await services.db.templates(auto_only=True):
                 try:
                     await message.answer(f"【{template_name}】\n\n{content}")
@@ -1200,6 +1316,95 @@ def build_dispatcher(services: Services) -> Dispatcher:
     async def whoami(message: Message) -> None:
         if message.from_user:
             await message.answer(f"你的 Telegram user_id：`{message.from_user.id}`", parse_mode="Markdown")
+
+
+    @router.message(Command("employee_codes"))
+    async def employee_codes_start(message: Message, state: FSMContext) -> None:
+        if not message.from_user or not _is_admin(message.from_user.id, services.settings):
+            await message.answer("无权使用此命令。")
+            return
+        if message.chat.type != ChatType.PRIVATE:
+            await message.answer("请在与机器人的私聊中使用此命令，避免工号显示在群聊里。")
+            return
+        if not services.sheets.configured:
+            await message.answer("Google 花名册尚未配置，无法分配工号。")
+            return
+        await state.clear()
+        await message.answer(
+            "请选择工号类型：",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="运营中心（YY）", callback_data="codepool:type:YY"),
+                    InlineKeyboardButton(text="技术中心（DN）", callback_data="codepool:type:DN"),
+                ],
+                [InlineKeyboardButton(text="效能中心（NX）", callback_data="codepool:type:NX")],
+            ]),
+        )
+
+    @router.callback_query(F.data.startswith("codepool:type:"))
+    async def employee_codes_choose_type(callback: CallbackQuery, state: FSMContext) -> None:
+        if not callback.from_user or not _is_admin(callback.from_user.id, services.settings):
+            await callback.answer("无权操作", show_alert=True)
+            return
+        prefix = (callback.data or "").rsplit(":", 1)[-1]
+        if prefix not in {"YY", "DN", "NX"}:
+            await callback.answer("工号类型无效", show_alert=True)
+            return
+        await state.clear()
+        await state.set_state(EmployeeCodeAllocation.waiting_for_count)
+        await state.update_data(employee_code_prefix=prefix)
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer(
+                f"已选择 {prefix}，请选择抽取数量：",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text=str(number), callback_data=f"codepool:count:{number}")
+                        for number in (1, 2, 3, 5, 10)
+                    ],
+                    [InlineKeyboardButton(text="输入数量", callback_data="codepool:custom")],
+                ]),
+            )
+
+    @router.callback_query(EmployeeCodeAllocation.waiting_for_count, F.data == "codepool:custom")
+    async def employee_codes_custom_count(callback: CallbackQuery, state: FSMContext) -> None:
+        if not callback.from_user or not _is_admin(callback.from_user.id, services.settings):
+            await callback.answer("无权操作", show_alert=True)
+            return
+        await state.set_state(EmployeeCodeAllocation.waiting_for_custom_count)
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer("请输入数量（1–50）。")
+
+    @router.callback_query(EmployeeCodeAllocation.waiting_for_count, F.data.startswith("codepool:count:"))
+    async def employee_codes_allocate_count(callback: CallbackQuery, state: FSMContext) -> None:
+        if not callback.from_user or not _is_admin(callback.from_user.id, services.settings):
+            await callback.answer("无权操作", show_alert=True)
+            return
+        try:
+            count = int((callback.data or "").rsplit(":", 1)[-1])
+        except ValueError:
+            await callback.answer("数量无效", show_alert=True)
+            return
+        if not 1 <= count <= 50:
+            await callback.answer("数量必须在 1–50 之间", show_alert=True)
+            return
+        await _allocate_manual_employee_codes(callback, state, count, services)
+
+    @router.message(EmployeeCodeAllocation.waiting_for_custom_count)
+    async def employee_codes_allocate_custom(message: Message, state: FSMContext) -> None:
+        if not message.from_user or not _is_admin(message.from_user.id, services.settings):
+            await state.clear()
+            return
+        try:
+            count = int((message.text or "").strip())
+        except ValueError:
+            await message.answer("请输入 1–50 的整数，或发送 /cancel 取消。")
+            return
+        if not 1 <= count <= 50:
+            await message.answer("数量需在 1–50 之间，或发送 /cancel 取消。")
+            return
+        await _allocate_manual_employee_codes(message, state, count, services)
 
     @router.message(Command("cancel"))
     async def cancel(message: Message, state: FSMContext) -> None:
@@ -3045,6 +3250,7 @@ ADMIN_COMMANDS = [
     BotCommand(command="attendance_check", description="管理员截图发起考勤抽查"),
     BotCommand(command="templates", description="管理员使用通知模板"),
     BotCommand(command="template_add", description="管理员创建或更新模板"),
+    BotCommand(command="employee_codes", description="抽取随机工号"),
     BotCommand(command="stats", description="管理员查看统计"),
     BotCommand(command="inbox", description="管理员查看员工消息"),
     BotCommand(command="sync", description="管理员同步花名册(只读)"),
