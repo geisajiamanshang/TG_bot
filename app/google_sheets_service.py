@@ -299,7 +299,7 @@ class GoogleSheetsService:
             if wanted not in {normalized(cell("AE")), normalized(cell("AF"))}:
                 continue
             hire_date = parse_sheet_date(cell(HIRE_DATE_COLUMN))
-            if hire_date is None or hire_date <= today:
+            if hire_date is None or hire_date < today:
                 continue
             matches.append({
                 "row": str(row_number),
